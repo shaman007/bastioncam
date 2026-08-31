@@ -66,8 +66,22 @@ def collect_once(db_path: str, embedded_hostname: str = "") -> tuple[int, int]:
 def collect_forever(db_path: str, interval: float, server_url: str | None = None,
                     token: str = "", embedded_hostname: str = "") -> None:
     LOG.info("collector started; interval=%ss database=%s", interval, db_path)
+    config={"paused":False,"config_revision":0,"poll_interval":30}
+    next_poll=0.0;last_error=""
     while True:
         try:
+            if server_url and time.monotonic() >= next_poll:
+                from .remote import poll_config
+                if not token:raise ValueError("remote server configured without a collector token")
+                try:
+                    config=poll_config(db_path,server_url,token,last_error)
+                    last_error="";next_poll=time.monotonic()+max(5,int(config.get("poll_interval",30)))
+                except Exception as error:
+                    last_error=str(error);next_poll=time.monotonic()+30
+                    LOG.warning("collector config poll failed: %s",error)
+            if server_url and config.get("paused"):
+                LOG.info("collector paused by server; revision=%s",config.get("config_revision"))
+                time.sleep(interval);continue
             seen, saved = collect_once(db_path, embedded_hostname)
             delivered = 0
             if server_url:
@@ -75,8 +89,10 @@ def collect_forever(db_path: str, interval: float, server_url: str | None = None
                     from .remote import push_pending
                     if not token:
                         raise ValueError("remote server configured without a collector token")
-                    delivered = push_pending(db_path, server_url, token)
+                    delivered = push_pending(db_path,server_url,token,
+                        config_revision=int(config.get("config_revision",0)))
                 except Exception as error:
+                    last_error=str(error)
                     LOG.warning("remote delivery failed; snapshots remain queued: %s", error)
             LOG.info("panes=%d new_snapshots=%d delivered=%d", seen, saved, delivered)
         except Exception:

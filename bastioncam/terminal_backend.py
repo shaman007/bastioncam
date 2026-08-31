@@ -17,6 +17,11 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def version() -> str:
+    result = run("--version")
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
 def sessions() -> list[str]:
     result = run("list-sessions", "--short")
     if result.returncode != 0:

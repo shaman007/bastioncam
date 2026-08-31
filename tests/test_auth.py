@@ -37,6 +37,17 @@ class CollectorAuthTest(unittest.TestCase):
                 authenticate(db, f"Bearer {token}")
             db.close()
 
+    def test_revoked_collector_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = connect(Path(directory) / "test.db")
+            collector, token = create_collector(db, "Retired laptop")
+            db.execute("UPDATE collectors SET revoked_at=? WHERE id=?",
+                       ("2026-01-01T00:00:00+00:00", collector["id"]))
+            db.commit()
+            with self.assertRaisesRegex(TokenError, "revoked"):
+                authenticate(db, f"Bearer {token}")
+            db.close()
+
     def test_embedded_collector_registration_is_stable(self):
         with tempfile.TemporaryDirectory() as directory:
             db = connect(Path(directory) / "test.db")

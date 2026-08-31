@@ -109,7 +109,21 @@ CREATE TABLE IF NOT EXISTS collectors (
   name TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
   last_seen_at TEXT,
-  disabled INTEGER NOT NULL DEFAULT 0
+  disabled INTEGER NOT NULL DEFAULT 0,
+  paused INTEGER NOT NULL DEFAULT 0,
+  revoked_at TEXT,
+  config_revision INTEGER NOT NULL DEFAULT 1,
+  owner TEXT NOT NULL DEFAULT '',
+  labels TEXT NOT NULL DEFAULT '',
+  hostname TEXT NOT NULL DEFAULT '',
+  operating_system TEXT NOT NULL DEFAULT '',
+  collector_version TEXT NOT NULL DEFAULT '',
+  backend_version TEXT NOT NULL DEFAULT '',
+  protocol_version INTEGER,
+  queue_size INTEGER NOT NULL DEFAULT 0,
+  last_upload_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  compatibility_error TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
@@ -144,6 +158,27 @@ def connect(path: str | Path) -> sqlite3.Connection:
     pane_columns = {row[1] for row in db.execute("PRAGMA table_info(panes)")}
     if "collector_id" not in pane_columns:
         db.execute("ALTER TABLE panes ADD COLUMN collector_id TEXT")
+    collector_columns = {row[1] for row in db.execute("PRAGMA table_info(collectors)")}
+    collector_migrations = {
+        "paused": "INTEGER NOT NULL DEFAULT 0",
+        "revoked_at": "TEXT",
+        "config_revision": "INTEGER NOT NULL DEFAULT 1",
+        "owner": "TEXT NOT NULL DEFAULT ''",
+        "labels": "TEXT NOT NULL DEFAULT ''",
+        "hostname": "TEXT NOT NULL DEFAULT ''",
+        "operating_system": "TEXT NOT NULL DEFAULT ''",
+        "collector_version": "TEXT NOT NULL DEFAULT ''",
+        "backend_version": "TEXT NOT NULL DEFAULT ''",
+        "protocol_version": "INTEGER",
+        "queue_size": "INTEGER NOT NULL DEFAULT 0",
+        "last_upload_at": "TEXT",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "compatibility_error": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in collector_migrations.items():
+        if column not in collector_columns:
+            db.execute(f"ALTER TABLE collectors ADD COLUMN {column} {definition}")
+    db.commit()
     return db
 
 

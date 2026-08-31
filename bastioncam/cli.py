@@ -10,7 +10,7 @@ from .collector import collect_forever, collect_once
 from .db import connect
 from .llm import build_segments, enrich_loop, enrich_pending
 from .security import scrub_database
-from .remote import push_pending
+from .remote import poll_config, push_pending
 from .web import serve
 
 
@@ -35,9 +35,13 @@ def main() -> None:
     args = parser().parse_args(); logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "collect-once":
         print("panes=%d snapshots=%d" % collect_once(args.db))
-        if args.server_url: print(f"delivered={push_pending(args.db,args.server_url,args.token)}")
+        if args.server_url:
+            config=poll_config(args.db,args.server_url,args.token)
+            print(f"delivered={push_pending(args.db,args.server_url,args.token,config_revision=config['config_revision'])}")
     elif args.command == "collect": collect_forever(args.db, args.interval, args.server_url, args.token)
-    elif args.command == "sync": print(f"delivered={push_pending(args.db,args.server_url,args.token,args.limit)}")
+    elif args.command == "sync":
+        config=poll_config(args.db,args.server_url,args.token)
+        print(f"delivered={push_pending(args.db,args.server_url,args.token,args.limit,config_revision=config['config_revision'])}")
     elif args.command == "serve": serve(args.db, args.host, args.port, args.ollama_url, args.embed_model)
     elif args.command == "run":
         threading.Thread(target=collect_forever,

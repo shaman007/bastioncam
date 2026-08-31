@@ -5,11 +5,8 @@ in the intended implementation order, but are not yet assigned to releases.
 
 ## 1. Collector identity and inventory
 
-- Give every collector a stable identity.
-- Add collector heartbeats and online/offline state.
-- Add a collectors overview with hostname, owner, labels, operating system,
-  collector and Zellij versions, last upload, queue size, and last error.
-- Support pausing, disabling, revoking, and configuring individual collectors.
+- Add explicit online/offline thresholds and notifications for collectors that
+  stop sending heartbeats.
 - Report protocol and version compatibility problems.
 
 ## 2. Search scopes and navigation

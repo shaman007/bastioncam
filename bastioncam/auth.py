@@ -87,8 +87,12 @@ def authenticate(db: sqlite3.Connection, authorization: str | None) -> dict:
         raise TokenError("invalid token signature")
     if payload.get("iss") != ISSUER or payload.get("aud") != AUDIENCE or not payload.get("sub"):
         raise TokenError("invalid token claims")
-    row = db.execute("SELECT id,name,created_at,last_seen_at,disabled FROM collectors WHERE id=?",
+    row = db.execute("SELECT * FROM collectors WHERE id=?",
                      (payload["sub"],)).fetchone()
-    if not row or row["disabled"]:
-        raise TokenError("unknown or disabled collector")
+    if not row:
+        raise TokenError("unknown collector")
+    if row["revoked_at"]:
+        raise TokenError("revoked collector")
+    if row["disabled"]:
+        raise TokenError("disabled collector")
     return dict(row)

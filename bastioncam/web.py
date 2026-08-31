@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from .auth import TokenError, authenticate, create_collector
 from .db import connect, cosine, decode_embedding
 from .llm import embed_query
+from .protocol import MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, compatibility_error
 from .search import fts_expression, parse_query
 from .security import redact_text
 from .webauth import check_credentials, create_session, create_user, delete_session, session_user
@@ -25,7 +26,7 @@ h1{font-size:22px}form,.controls,.actions{display:flex;gap:8px;align-items:cente
 pre{white-space:pre-wrap;background:#080b0f;padding:18px;border-radius:8px;min-height:360px;overflow:auto;line-height:1.35}.added{display:block;background:#163522;border-left:3px solid #4fb477;padding-left:5px}.controls{margin:12px 0}.controls input[type=range]{flex:1;min-width:220px}.clock{font-variant-numeric:tabular-nums}.muted{color:#8290a8}
 .calendar-head{display:flex;justify-content:space-between;align-items:center;margin:18px 0}.calendar{display:grid;grid-template-columns:repeat(7,minmax(60px,1fr));gap:5px}.weekday{text-align:center;color:#8290a8;padding:7px}.day{min-height:72px;background:#181e27;border:1px solid #303846;border-radius:7px;padding:8px;color:#d8dee9;text-decoration:none}.day.outside{opacity:.25}.day.active{border-color:#5277c3;background:#1d2940}.day.selected{outline:2px solid #78a4ff}.day-count{display:block;color:#8fa1bd;font-size:11px;margin-top:18px}.day-summary,.hour-summary{background:#181e27;border:1px solid #303846;border-radius:8px;padding:14px;margin:10px 0}.day-summary p,.hour-summary p{white-space:pre-wrap}.hour-summary h3{margin:0 0 7px;font-size:15px;color:#9db4d8}
 .episode-link{color:#9db4d8;text-decoration:underline;text-underline-offset:3px}.episode-link:hover{color:#fff}
-.token{width:100%;min-height:110px;box-sizing:border-box;background:#080b0f;color:#d8dee9;border:1px solid #455066;border-radius:7px;padding:10px;overflow-wrap:anywhere}.collector-row{display:grid;grid-template-columns:minmax(180px,1fr) 2fr;gap:12px;padding:12px 0;border-bottom:1px solid #303846}.notice{padding:12px;border:1px solid #5277c3;background:#1d2940;border-radius:7px;margin:14px 0}
+.token{width:100%;min-height:110px;box-sizing:border-box;background:#080b0f;color:#d8dee9;border:1px solid #455066;border-radius:7px;padding:10px;overflow-wrap:anywhere}.collector-row{display:grid;grid-template-columns:minmax(220px,1fr) 3fr;gap:12px;padding:16px 0;border-bottom:1px solid #303846}.notice{padding:12px;border:1px solid #5277c3;background:#1d2940;border-radius:7px;margin:14px 0}.warning{color:#ffbf69}.danger{background:#a33}.collector-config{margin-top:10px}.collector-config input{min-width:180px}
 @media(max-width:900px){.layout{grid-template-columns:1fr}aside{position:static;border-left:0;border-top:1px solid #303846;padding:18px 0 0;max-height:none}}
 """
 
@@ -209,7 +210,7 @@ class App(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         if path == "/setup":return self.setup_submit()
         if path == "/login":return self.login_submit()
-        if path != "/api/ingest":
+        if path not in ("/api/ingest","/api/collector/heartbeat"):
             user=self.require_user()
             if not user:return
             try:values=self.form_values()
@@ -242,7 +243,51 @@ class App(BaseHTTPRequestHandler):
                 except Exception as error:
                     message="A collector with that name already exists." if "UNIQUE constraint failed" in str(error) else "Could not create collector."
                     return self.admin_collectors(error=message,status=409)
+            if path == "/admin/collectors/action":
+                collector_id=values.get("collector_id",[""])[0]
+                action=values.get("action",[""])[0]
+                db=connect(self.db_path)
+                row=db.execute("SELECT * FROM collectors WHERE id=?",(collector_id,)).fetchone()
+                if not row:db.close();return self.admin_collectors(error="Collector not found.",status=404)
+                stamp=datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
+                if action=="pause":
+                    db.execute("UPDATE collectors SET paused=1-paused,config_revision=config_revision+1 WHERE id=? AND revoked_at IS NULL",(collector_id,))
+                elif action=="disable":
+                    db.execute("UPDATE collectors SET disabled=1-disabled,config_revision=config_revision+1 WHERE id=? AND revoked_at IS NULL",(collector_id,))
+                elif action=="revoke":
+                    db.execute("UPDATE collectors SET revoked_at=?,disabled=1,paused=1,config_revision=config_revision+1 WHERE id=? AND revoked_at IS NULL",(stamp,collector_id))
+                elif action=="configure":
+                    owner=" ".join(values.get("owner",[""])[0].strip().split())[:120]
+                    labels=", ".join(x.strip() for x in values.get("labels",[""])[0].split(",") if x.strip())[:500]
+                    db.execute("UPDATE collectors SET owner=?,labels=?,config_revision=config_revision+1 WHERE id=? AND revoked_at IS NULL",(owner,labels,collector_id))
+                else:db.close();return self.admin_collectors(error="Unknown collector action.",status=400)
+                db.commit();db.close();return self.redirect("/admin/collectors")
             return self.send_error(404)
+        if path == "/api/collector/heartbeat":
+            try:
+                length=int(self.headers.get("Content-Length","0"))
+                if length<=0 or length>65536:return self.send_json({"error":"invalid payload size"},413)
+                payload=json.loads(self.rfile.read(length));db=connect(self.db_path)
+                try:collector=authenticate(db,self.headers.get("Authorization"))
+                except TokenError as error:db.close();return self.send_json({"error":str(error)},401)
+                try:protocol=int(payload.get("protocol_version",0))
+                except (TypeError,ValueError):protocol=0
+                problem=compatibility_error(protocol)
+                stamp=datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
+                reported_error=str(payload.get("last_error",""))[:2000]
+                db.execute("""UPDATE collectors SET last_seen_at=?,hostname=?,operating_system=?,
+                    collector_version=?,backend_version=?,protocol_version=?,queue_size=?,
+                    last_error=CASE WHEN ?<>'' THEN ? ELSE last_error END,compatibility_error=?
+                    WHERE id=?""",(stamp,str(payload.get("hostname",""))[:255],str(payload.get("operating_system",""))[:500],
+                    str(payload.get("collector_version",""))[:100],str(payload.get("backend_version",""))[:100],protocol,
+                    max(0,int(payload.get("queue_size",0))),reported_error,reported_error,problem,collector["id"]))
+                db.commit();current=db.execute("SELECT paused,config_revision,owner,labels FROM collectors WHERE id=?",(collector["id"],)).fetchone();db.close()
+                response={"paused":bool(current["paused"]),"config_revision":current["config_revision"],
+                    "owner":current["owner"],"labels":[x.strip() for x in current["labels"].split(",") if x.strip()],
+                    "poll_interval":30,"protocol_min":MIN_PROTOCOL_VERSION,"protocol_max":MAX_PROTOCOL_VERSION}
+                if problem:response["error"]=problem;return self.send_json(response,426)
+                return self.send_json(response)
+            except (ValueError,TypeError,json.JSONDecodeError) as error:return self.send_json({"error":str(error)},400)
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > 2 * 1024 * 1024:
@@ -259,6 +304,18 @@ class App(BaseHTTPRequestHandler):
                 collector=authenticate(db,self.headers.get("Authorization"))
             except TokenError as error:
                 db.close();return self.send_json({"error":str(error)},401)
+            try:protocol=int(self.headers.get("X-BastionCam-Protocol","0"))
+            except ValueError:protocol=0
+            problem=compatibility_error(protocol)
+            if problem:
+                db.execute("UPDATE collectors SET protocol_version=?,compatibility_error=? WHERE id=?",(protocol,problem,collector["id"]));db.commit();db.close()
+                return self.send_json({"error":problem,"protocol_min":MIN_PROTOCOL_VERSION,"protocol_max":MAX_PROTOCOL_VERSION},426)
+            try:revision=int(self.headers.get("X-BastionCam-Config-Revision","0"))
+            except ValueError:revision=0
+            if collector["paused"]:
+                db.close();return self.send_json({"error":"collector is paused; payload ignored","config_revision":collector["config_revision"]},409)
+            if revision != collector["config_revision"]:
+                db.close();return self.send_json({"error":"stale collector configuration; payload ignored","config_revision":collector["config_revision"]},409)
             session = f"{collector['name'][:120]}/{payload['session_name'][:160]}"
             db.execute("""INSERT INTO panes(collector_id,session_name,pane_key,tab_name,title,command,cwd,first_seen,last_seen)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(session_name,pane_key) DO UPDATE SET
@@ -277,7 +334,7 @@ class App(BaseHTTPRequestHandler):
             if created:
                 db.execute("INSERT INTO snapshots(pane_id,captured_at,content,content_hash,delivered_at) VALUES(?,?,?,?,?)",
                            (pane_id, payload["captured_at"], content, digest, stamp))
-            db.execute("UPDATE collectors SET last_seen_at=? WHERE id=?",(stamp,collector["id"]))
+            db.execute("UPDATE collectors SET last_seen_at=?,last_upload_at=?,compatibility_error='' WHERE id=?",(stamp,stamp,collector["id"]))
             db.commit(); db.close()
             return self.send_json({"accepted": True, "created": created}, 201 if created else 200)
         except (ValueError, TypeError, json.JSONDecodeError) as error:
@@ -339,7 +396,7 @@ class App(BaseHTTPRequestHandler):
                          status: int = 200) -> None:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
         db=connect(self.db_path)
-        rows=db.execute("SELECT id,name,created_at,last_seen_at,disabled FROM collectors ORDER BY created_at DESC").fetchall();db.close()
+        rows=db.execute("SELECT * FROM collectors ORDER BY created_at DESC").fetchall();db.close()
         message=""
         if token:
             message=(f"<div class=notice><strong>Token for {html.escape(created_name)}</strong>"
@@ -349,9 +406,18 @@ class App(BaseHTTPRequestHandler):
         items=[]
         for row in rows:
             kind="embedded" if row["id"].startswith("embedded:") else "JWT"
-            state="disabled" if row["disabled"] else "active"
+            state="revoked" if row["revoked_at"] else "disabled" if row["disabled"] else "paused" if row["paused"] else "active"
             seen=html.escape(row["last_seen_at"] or "never")
-            items.append(f"<div class=collector-row><div><strong>{html.escape(row['name'])}</strong><div class=meta>{kind} · {state}</div></div><div class=meta>ID: {html.escape(row['id'])}<br>Created: {html.escape(row['created_at'])}<br>Last seen: {seen}</div></div>")
+            compatibility=f"<div class=warning>{html.escape(row['compatibility_error'])}</div>" if row["compatibility_error"] else ""
+            error=f"<div class=warning>Last error: {html.escape(row['last_error'])}</div>" if row["last_error"] else ""
+            buttons="" if row["revoked_at"] else (f"<form method=post action='/admin/collectors/action'><input type=hidden name=csrf value='{csrf}'><input type=hidden name=collector_id value='{html.escape(row['id'])}'>"
+                f"<button name=action value=pause>{'Resume' if row['paused'] else 'Pause'}</button><button name=action value=disable>{'Enable' if row['disabled'] else 'Disable'}</button><button class=danger name=action value=revoke onclick=\"return confirm('Revoke this collector permanently?')\">Revoke</button></form>")
+            configure="" if row["revoked_at"] else (f"<form class=collector-config method=post action='/admin/collectors/action'><input type=hidden name=csrf value='{csrf}'><input type=hidden name=collector_id value='{html.escape(row['id'])}'><input type=hidden name=action value=configure>"
+                f"<input name=owner maxlength=120 placeholder=Owner value='{html.escape(row['owner'])}'><input name=labels maxlength=500 placeholder='labels, comma-separated' value='{html.escape(row['labels'])}'><button>Save config</button></form>")
+            details=(f"Hostname: {html.escape(row['hostname'] or 'unknown')}<br>Owner: {html.escape(row['owner'] or '—')}<br>Labels: {html.escape(row['labels'] or '—')}<br>OS: {html.escape(row['operating_system'] or 'unknown')}<br>"
+                f"Collector: {html.escape(row['collector_version'] or 'unknown')} · Zellij: {html.escape(row['backend_version'] or 'unknown')} · protocol: {row['protocol_version'] if row['protocol_version'] is not None else 'unknown'}<br>"
+                f"Last heartbeat: {seen} · last upload: {html.escape(row['last_upload_at'] or 'never')} · queue: {row['queue_size']} · config revision: {row['config_revision']}")
+            items.append(f"<div class=collector-row><div><strong>{html.escape(row['name'])}</strong><div class=meta>{kind} · {state}</div>{buttons}</div><div class=meta>{details}{compatibility}{error}{configure}</div></div>")
         body=("<div class=actions><a class=btn href='/'>Calendar</a></div><h1>Collector admin</h1>"
               "<p class=muted>Create a named identity for a remote collector. The JWT is displayed once.</p>"
               f"{message}<form method=post action='/admin/collectors'><input type=hidden name=csrf value='{csrf}'><input name=name required maxlength=120 placeholder='Office workstation'><button>Generate token</button></form>"

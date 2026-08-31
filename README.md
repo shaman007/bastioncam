@@ -79,6 +79,14 @@ the verified collector name as the session namespace, performs secret filtering
 again, stores snapshots, serves the UI, and runs enrichment. A standalone
 collector unit template is available under `deploy/collector/`.
 
+Collectors send a protocol-v1 heartbeat every 30 seconds. The heartbeat reports
+hostname, operating system, collector and terminal-backend versions, queue depth,
+and the most recent delivery error, then receives the current configuration
+revision and pause state. The collector admin page can set owner and labels,
+pause/resume collection, temporarily disable credentials, or permanently revoke
+a collector. Uploads carrying an unsupported protocol, a stale configuration
+revision, or a paused identity are rejected without storing their payload.
+
 ## Container image
 
 Build the image locally:
