@@ -115,6 +115,11 @@ class App(BaseHTTPRequestHandler):
         if not user:self.redirect("/setup" if not self.users_exist() else "/login")
         return user
 
+    def require_admin(self) -> dict | None:
+        user=self.require_user()
+        if user and user["role"] != "admin":self.send_error(403,"Administrator access required")
+        return user if user and user["role"] == "admin" else None
+
     def form_values(self, maximum: int = 8192) -> dict[str,list[str]]:
         length=int(self.headers.get("Content-Length","0"))
         if length <= 0 or length > maximum:raise ValueError("invalid form size")
@@ -131,18 +136,19 @@ class App(BaseHTTPRequestHandler):
 
     def sidebar(self) -> str:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
+        admin_links="<a href='/admin/collectors'>Collector admin</a> · <a href='/admin/users'>Users</a>" if user and user["role"]=="admin" else ""
         db = connect(self.db_path)
         rows = db.execute("""SELECT period_type,period_start,period_end,summary,segment_count
             FROM period_summaries ORDER BY period_start DESC,period_type LIMIT 12""").fetchall(); db.close()
         if not rows:
-            return f"<h2>Summaries</h2><p class=muted>Summaries will appear after the first episodes are processed.</p><p><a href='/admin/collectors'>Collector admin</a> · <a href='/admin/users'>Users</a></p><form method=post action='/logout'><input type=hidden name=csrf value='{csrf}'><button>Log out</button></form>"
+            return f"<h2>Summaries</h2><p class=muted>Summaries will appear after the first episodes are processed.</p><p>{admin_links}</p><form method=post action='/logout'><input type=hidden name=csrf value='{csrf}'><button>Log out</button></form>"
         tz = ZoneInfo("Europe/Prague"); cards=[]
         for row in rows:
             start=datetime.fromisoformat(row["period_start"]).astimezone(tz)
             label=start.strftime("%d.%m.%Y, %H:00") if row["period_type"]=="hour" else start.strftime("%d.%m.%Y")
             kind="Hour" if row["period_type"]=="hour" else "Day"
             cards.append(f"<a href='/?month={start:%Y-%m}&day={start:%Y-%m-%d}' style='color:inherit;text-decoration:none'><div class=period-card><div class=period-title>{kind} · {label} · episodes: {row['segment_count']}</div><p>{html.escape(row['summary'])}</p></div></a>")
-        return "<h2><a href='/' style='color:inherit'>Work summaries</a></h2>"+"".join(cards)+f"<p><a href='/admin/collectors'>Collector admin</a> · <a href='/admin/users'>Users</a></p><form method=post action='/logout'><input type=hidden name=csrf value='{csrf}'><button>Log out</button></form>"
+        return "<h2><a href='/' style='color:inherit'>Work summaries</a></h2>"+"".join(cards)+f"<p>{admin_links}</p><form method=post action='/logout'><input type=hidden name=csrf value='{csrf}'><button>Log out</button></form>"
 
     def send_json(self, value: object, status: int = 200) -> None:
         data = json.dumps(value, ensure_ascii=False).encode(); self.send_response(status)
@@ -165,8 +171,12 @@ class App(BaseHTTPRequestHandler):
                 return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0])
             if url.path == "/calendar":
                 params=parse_qs(url.query); return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0])
-            if url.path == "/admin/collectors": return self.admin_collectors()
-            if url.path == "/admin/users": return self.admin_users()
+            if url.path == "/admin/collectors":
+                if self.require_admin():return self.admin_collectors()
+                return
+            if url.path == "/admin/users":
+                if self.require_admin():return self.admin_users()
+                return
             if url.path.startswith("/snapshot/"): return self.player(int(url.path.rsplit("/", 1)[1]),parse_qs(url.query).get("collector",[""])[0])
             if url.path.startswith("/api/snapshot/"): return self.api_snapshot(int(url.path.rsplit("/", 1)[1]))
             if url.path.startswith("/api/timeline/"): return self.api_timeline(int(url.path.rsplit("/", 1)[1]))
@@ -239,18 +249,36 @@ class App(BaseHTTPRequestHandler):
                 finally:db.close()
                 return self.redirect("/login","zh_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
             if path == "/admin/users":
+                if user["role"] != "admin":return self.send_error(403,"Administrator access required")
                 try:
                     password=values.get("password",[""])[0]
                     if password != values.get("confirm_password",[""])[0]:raise ValueError("passwords do not match")
                     db=connect(self.db_path)
-                    try:new_user=create_user(db,values.get("username",[""])[0],password)
+                    try:new_user=create_user(db,values.get("username",[""])[0],password,"reader")
                     finally:db.close()
                     return self.admin_users(message=f"Created user {new_user['username']}.")
                 except ValueError as error:return self.admin_users(error=str(error),status=400)
                 except Exception as error:
                     message="That username already exists." if "UNIQUE constraint failed" in str(error) else "Could not create user."
                     return self.admin_users(error=message,status=409)
+            if path == "/admin/users/action":
+                if user["role"] != "admin":return self.send_error(403,"Administrator access required")
+                try:user_id=int(values.get("user_id",[""])[0])
+                except ValueError:return self.admin_users(error="Invalid user.",status=400)
+                action=values.get("action",[""])[0];db=connect(self.db_path)
+                row=db.execute("SELECT role,blocked_at FROM users WHERE id=?",(user_id,)).fetchone()
+                if not row or row["role"] != "reader":db.close();return self.admin_users(error="Reader not found.",status=404)
+                if action == "block":
+                    blocked_at=None if row["blocked_at"] else datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
+                    db.execute("UPDATE users SET blocked_at=? WHERE id=?",(blocked_at,user_id))
+                    if blocked_at:db.execute("DELETE FROM web_sessions WHERE user_id=?",(user_id,))
+                elif action == "delete":
+                    db.execute("DELETE FROM web_sessions WHERE user_id=?",(user_id,))
+                    db.execute("DELETE FROM users WHERE id=?",(user_id,))
+                else:db.close();return self.admin_users(error="Unknown user action.",status=400)
+                db.commit();db.close();return self.redirect("/admin/users")
             if path == "/admin/collectors":
+                if user["role"] != "admin":return self.send_error(403,"Administrator access required")
                 try:
                     db=connect(self.db_path)
                     try:collector,token=create_collector(db,values.get("name",[""])[0])
@@ -261,6 +289,7 @@ class App(BaseHTTPRequestHandler):
                     message="A collector with that name already exists." if "UNIQUE constraint failed" in str(error) else "Could not create collector."
                     return self.admin_collectors(error=message,status=409)
             if path == "/admin/collectors/action":
+                if user["role"] != "admin":return self.send_error(403,"Administrator access required")
                 collector_id=values.get("collector_id",[""])[0]
                 action=values.get("action",[""])[0]
                 db=connect(self.db_path)
@@ -362,7 +391,7 @@ class App(BaseHTTPRequestHandler):
     def setup_page(self, error: str = "", status: int = 200) -> None:
         if self.users_exist():return self.redirect("/login")
         message=f"<div class=notice>{html.escape(error)}</div>" if error else ""
-        self.send_auth_page("<h1>Create first admin</h1><p class=muted>All users currently have the admin role.</p>"+message+
+        self.send_auth_page("<h1>Create first admin</h1><p class=muted>This account can manage readers and collectors.</p>"+message+
             "<form method=post action='/setup'><input name=username required maxlength=80 autocomplete=username placeholder='Username'><input type=password name=password required minlength=10 autocomplete=new-password placeholder='Password'><input type=password name=confirm_password required minlength=10 autocomplete=new-password placeholder='Confirm password'><button>Create admin</button></form>",status)
 
     def setup_submit(self) -> None:
@@ -401,12 +430,17 @@ class App(BaseHTTPRequestHandler):
     def admin_users(self, message: str = "", error: str = "", status: int = 200) -> None:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
         db=connect(self.db_path)
-        rows=db.execute("SELECT username,created_at FROM users ORDER BY created_at").fetchall();db.close()
+        rows=db.execute("SELECT id,username,created_at,role,blocked_at FROM users ORDER BY created_at").fetchall();db.close()
         notice=f"<div class=notice>{html.escape(error or message)}</div>" if error or message else ""
-        items="".join(f"<div class=collector-row><strong>{html.escape(row['username'])}</strong><div class=meta>Admin · created {html.escape(row['created_at'])}</div></div>" for row in rows)
+        admins="".join(f"<div class=collector-row><strong>{html.escape(row['username'])}</strong><div class=meta>Admin · created {html.escape(row['created_at'])}</div></div>" for row in rows if row["role"]=="admin")
+        readers=[]
+        for row in rows:
+            if row["role"] != "reader":continue
+            state="blocked" if row["blocked_at"] else "active"
+            readers.append(f"<div class=collector-row><div><strong>{html.escape(row['username'])}</strong><div class=meta>Reader · {state} · created {html.escape(row['created_at'])}</div></div><form method=post action='/admin/users/action'><input type=hidden name=csrf value='{csrf}'><input type=hidden name=user_id value='{row['id']}'><button name=action value=block>{'Unblock' if row['blocked_at'] else 'Block'}</button><button class=danger name=action value=delete onclick=\"return confirm('Delete this reader permanently?')\">Delete</button></form></div>")
         body=("<div class=actions><a class=btn href='/'>Calendar</a><a class=btn href='/admin/collectors'>Collectors</a></div><h1>Users</h1>"
-              "<p class=muted>Every user currently has the admin role.</p>"+notice+
-              f"<form method=post action='/admin/users'><input type=hidden name=csrf value='{csrf}'><input name=username required maxlength=80 autocomplete=off placeholder='Username'><input type=password name=password required minlength=10 autocomplete=new-password placeholder='Password'><input type=password name=confirm_password required minlength=10 autocomplete=new-password placeholder='Confirm password'><button>Add user</button></form><h2>Administrators</h2>"+items)
+              "<p class=muted>Readers can view recordings and summaries. Administrators can manage readers and collectors.</p>"+notice+
+              f"<form method=post action='/admin/users'><input type=hidden name=csrf value='{csrf}'><input name=username required maxlength=80 autocomplete=off placeholder='Username'><input type=password name=password required minlength=10 autocomplete=new-password placeholder='Password'><input type=password name=confirm_password required minlength=10 autocomplete=new-password placeholder='Confirm password'><button>Add reader</button></form><h2>Readers</h2>"+("".join(readers) if readers else "<p class=muted>No readers yet.</p>")+"<h2>Administrators</h2>"+admins)
         self.send_page(body,status)
 
     def admin_collectors(self, token: str = "", created_name: str = "", error: str = "",

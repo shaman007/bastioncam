@@ -42,21 +42,23 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
-def create_user(db: sqlite3.Connection, username: str, password: str) -> dict:
+def create_user(db: sqlite3.Connection, username: str, password: str, role: str = "admin") -> dict:
     username = normalize_username(username)
+    if role not in ("admin", "reader"):
+        raise ValueError("invalid user role")
     created_at = _now().isoformat(timespec="seconds")
-    cursor = db.execute("INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)",
-                        (username, hash_password(password), created_at))
+    cursor = db.execute("INSERT INTO users(username,password_hash,created_at,role) VALUES(?,?,?,?)",
+                        (username, hash_password(password), created_at, role))
     db.commit()
-    return {"id": cursor.lastrowid, "username": username, "created_at": created_at}
+    return {"id": cursor.lastrowid, "username": username, "created_at": created_at, "role": role}
 
 
 def check_credentials(db: sqlite3.Connection, username: str, password: str) -> dict | None:
-    row = db.execute("SELECT id,username,password_hash,created_at FROM users WHERE username=?",
+    row = db.execute("SELECT id,username,password_hash,created_at,role,blocked_at FROM users WHERE username=?",
                      (username.strip(),)).fetchone()
-    if not row or not verify_password(password, row["password_hash"]):
+    if not row or row["blocked_at"] or not verify_password(password, row["password_hash"]):
         return None
-    return {"id": row["id"], "username": row["username"], "created_at": row["created_at"]}
+    return {key: row[key] for key in ("id", "username", "created_at", "role")}
 
 
 def create_session(db: sqlite3.Connection, user_id: int) -> tuple[str, str]:
@@ -75,9 +77,9 @@ def session_user(db: sqlite3.Connection, token: str) -> dict | None:
     if not token:
         return None
     now = _now().isoformat()
-    row = db.execute("""SELECT u.id,u.username,u.created_at,s.csrf_token,s.expires_at
+    row = db.execute("""SELECT u.id,u.username,u.created_at,u.role,s.csrf_token,s.expires_at
         FROM web_sessions s JOIN users u ON u.id=s.user_id
-        WHERE s.token_hash=? AND s.expires_at>?""",
+        WHERE s.token_hash=? AND s.expires_at>? AND u.blocked_at IS NULL""",
         (hashlib.sha256(token.encode()).hexdigest(), now)).fetchone()
     return dict(row) if row else None
 

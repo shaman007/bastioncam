@@ -24,9 +24,10 @@ Open <http://127.0.0.1:8787>. Only changed viewports are stored, so an idle
 terminal does not grow the database.
 
 On first open, `/setup` creates the initial administrator. Browser access then
-requires a username and password. Every account currently has the single
-`admin` role and can add another administrator with a chosen password under
-`/admin/users`. Passwords are stored as salted scrypt hashes; browser sessions
+requires a username and password. The initial account has the `admin` role and
+can create, block, unblock, and delete `reader` accounts under `/admin/users`.
+Readers can view recordings and summaries but cannot access administration.
+Passwords are stored as salted scrypt hashes; browser sessions
 use seven-day HttpOnly, SameSite cookies and CSRF tokens on administrative
 forms. The health check and JWT-authenticated ingestion endpoint do not use the
 browser session.

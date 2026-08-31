@@ -129,7 +129,9 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'admin' CHECK(role IN ('admin','reader')),
+  blocked_at TEXT
 );
 CREATE TABLE IF NOT EXISTS web_sessions (
   token_hash TEXT PRIMARY KEY,
@@ -178,6 +180,11 @@ def connect(path: str | Path) -> sqlite3.Connection:
     for column, definition in collector_migrations.items():
         if column not in collector_columns:
             db.execute(f"ALTER TABLE collectors ADD COLUMN {column} {definition}")
+    user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+    if "role" not in user_columns:
+        db.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+    if "blocked_at" not in user_columns:
+        db.execute("ALTER TABLE users ADD COLUMN blocked_at TEXT")
     db.commit()
     return db
 
