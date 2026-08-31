@@ -1,0 +1,15 @@
+[Unit]
+Description=Local BastionCam collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shaman007/git/bastioncam
+EnvironmentFile=%h/.config/bastioncam/collector.env
+ExecStart=/home/shaman007/git/bastioncam/.venv/bin/python -m bastioncam.cli --db /home/shaman007/.local/share/bastioncam/collector.db collect --interval 5 --server-url http://bastioncam.w386.k8s.my.lan
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

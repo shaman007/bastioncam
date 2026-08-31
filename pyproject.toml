@@ -1,0 +1,16 @@
+[project]
+name = "bastioncam"
+version = "0.1.0"
+description = "Local searchable history and playback for Zellij panes"
+requires-python = ">=3.11"
+dependencies = ["detect-secrets>=1.5,<2"]
+
+[project.scripts]
+bastioncam = "bastioncam.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bastioncam"]
