@@ -10,10 +10,8 @@ TLS ingress, searchable snapshots and summaries, and calendar/episode navigation
 These are intentionally narrow changes that reuse the current SQLite schema and
 web application and should not require new infrastructure:
 
-- Show collectors as online, stale, or offline using configurable heartbeat-age
-  thresholds. Sort unhealthy collectors first and show their age in friendly form.
-- Add a collector selector to search and calendar pages. Preserve the selected
-  collector in result, episode, day, and hour links.
+- Add collector scoping to calendar activity and summaries. Collector-scoped
+  snapshot and episode search is already supported.
 - Expand `/healthz` with database readability/writability and schema-version
   checks, while keeping the response safe for unauthenticated probes.
 - Add simple pagination and result-count limits to search and collector inventory.
@@ -23,15 +21,15 @@ web application and should not require new infrastructure:
 ## 1. Collector identity and inventory
 
 - Add notifications for collectors that remain offline beyond a configured
-  threshold. Basic online/stale/offline presentation is tracked above.
+  threshold.
 - Allow administrators to rotate a collector credential without replacing its
   identity or historical ownership.
 - Add bulk owner/label editing after the single-collector workflow has settled.
 
 ## 2. Search scopes and navigation
 
-- Filter searches by collector, owner, session, tab, command, working directory,
-  label, and date range.
+- Filter searches by owner, session, tab, command, working directory, label, and
+  date range. Collector-scoped search is already supported.
 - Support saved searches and bookmarks.
 - Add a global activity timeline across collectors.
 - Group repetitive results by task or session.

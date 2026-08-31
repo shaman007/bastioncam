@@ -86,6 +86,10 @@ revision and pause state. The collector admin page can set owner and labels,
 pause/resume collection, temporarily disable credentials, or permanently revoke
 a collector. Uploads carrying an unsupported protocol, a stale configuration
 revision, or a paused identity are rejected without storing their payload.
+Admin inventory classifies heartbeat age as online (up to 90 seconds), stale
+(up to five minutes), or offline, and lists unhealthy collectors first. Search
+can be scoped to one collector, including revoked collectors' historical data;
+the selection is retained when opening a result or returning from playback.
 
 ## Container image
 

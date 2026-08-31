@@ -19,6 +19,9 @@ from .search import fts_expression, parse_query
 from .security import redact_text
 from .webauth import check_credentials, create_session, create_user, delete_session, session_user
 
+COLLECTOR_STALE_AFTER = 90
+COLLECTOR_OFFLINE_AFTER = 300
+
 CSS = """
 body{margin:0;background:#11151b;color:#d8dee9;font:15px system-ui}main{max-width:1450px;margin:auto;padding:28px}.layout{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:28px}.primary{min-width:0}aside{border-left:1px solid #303846;padding-left:22px;position:sticky;top:20px;align-self:start;max-height:calc(100vh - 40px);overflow:auto}aside h2{font-size:16px;margin:8px 0}.period-card{background:#181e27;border:1px solid #303846;border-radius:8px;padding:11px;margin:9px 0}.period-card p{white-space:pre-wrap;font-size:13px;line-height:1.35;margin:6px 0}.period-title{color:#9db4d8;font-size:12px}
 h1{font-size:22px}form,.controls,.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}input[type=search]{flex:1;min-width:260px;padding:12px}input,select{background:#202630;color:#fff;border:1px solid #455066;border-radius:7px;padding:8px}button,a.btn{padding:10px 14px;background:#5277c3;color:white;border:0;border-radius:7px;text-decoration:none;cursor:pointer}
@@ -63,6 +66,19 @@ fetch('/api/timeline/'+initialId).then(r=>{if(!r.ok)throw new Error('timeline AP
 
 def page(body: str, sidebar: str, title: str = "BastionCam") -> bytes:
     return f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width'><title>{title}</title><style>{CSS}</style></head><body><main><div class=layout><section class=primary>{body}</section><aside>{sidebar}</aside></div></main></body></html>".encode()
+
+
+def collector_presence(last_seen_at: str | None, now: datetime | None = None) -> tuple[str, str, int]:
+    if not last_seen_at:
+        return "offline", "never seen", 2
+    current=now or datetime.now(ZoneInfo("UTC"))
+    seen=datetime.fromisoformat(last_seen_at)
+    if seen.tzinfo is None:seen=seen.replace(tzinfo=ZoneInfo("UTC"))
+    seconds=max(0,int((current-seen.astimezone(ZoneInfo("UTC"))).total_seconds()))
+    age=f"{seconds}s ago" if seconds < 60 else f"{seconds//60}m ago" if seconds < 3600 else f"{seconds//3600}h ago" if seconds < 86400 else f"{seconds//86400}d ago"
+    if seconds <= COLLECTOR_STALE_AFTER:return "online",age,0
+    if seconds <= COLLECTOR_OFFLINE_AFTER:return "stale",age,1
+    return "offline",age,2
 
 
 class App(BaseHTTPRequestHandler):
@@ -143,14 +159,15 @@ class App(BaseHTTPRequestHandler):
             if url.path == "/":
                 params=parse_qs(url.query)
                 query=params.get("q",[""])[0]
-                if query.strip() or "start" in params or "end" in params:
-                    return self.index(query,params.get("start",[""])[0],params.get("end",[""])[0])
+                collector_id=params.get("collector",[""])[0]
+                if query.strip() or "start" in params or "end" in params or collector_id:
+                    return self.index(query,params.get("start",[""])[0],params.get("end",[""])[0],collector_id)
                 return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0])
             if url.path == "/calendar":
                 params=parse_qs(url.query); return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0])
             if url.path == "/admin/collectors": return self.admin_collectors()
             if url.path == "/admin/users": return self.admin_users()
-            if url.path.startswith("/snapshot/"): return self.player(int(url.path.rsplit("/", 1)[1]))
+            if url.path.startswith("/snapshot/"): return self.player(int(url.path.rsplit("/", 1)[1]),parse_qs(url.query).get("collector",[""])[0])
             if url.path.startswith("/api/snapshot/"): return self.api_snapshot(int(url.path.rsplit("/", 1)[1]))
             if url.path.startswith("/api/timeline/"): return self.api_timeline(int(url.path.rsplit("/", 1)[1]))
         except ValueError:
@@ -396,7 +413,9 @@ class App(BaseHTTPRequestHandler):
                          status: int = 200) -> None:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
         db=connect(self.db_path)
-        rows=db.execute("SELECT * FROM collectors ORDER BY created_at DESC").fetchall();db.close()
+        rows=list(db.execute("SELECT * FROM collectors ORDER BY created_at DESC").fetchall());db.close()
+        presence={row["id"]:collector_presence(row["last_seen_at"]) for row in rows}
+        rows.sort(key=lambda row:(-presence[row["id"]][2],row["created_at"]))
         message=""
         if token:
             message=(f"<div class=notice><strong>Token for {html.escape(created_name)}</strong>"
@@ -407,6 +426,7 @@ class App(BaseHTTPRequestHandler):
         for row in rows:
             kind="embedded" if row["id"].startswith("embedded:") else "JWT"
             state="revoked" if row["revoked_at"] else "disabled" if row["disabled"] else "paused" if row["paused"] else "active"
+            connection,seen_age,_=presence[row["id"]]
             seen=html.escape(row["last_seen_at"] or "never")
             compatibility=f"<div class=warning>{html.escape(row['compatibility_error'])}</div>" if row["compatibility_error"] else ""
             error=f"<div class=warning>Last error: {html.escape(row['last_error'])}</div>" if row["last_error"] else ""
@@ -417,7 +437,7 @@ class App(BaseHTTPRequestHandler):
             details=(f"Hostname: {html.escape(row['hostname'] or 'unknown')}<br>Owner: {html.escape(row['owner'] or '—')}<br>Labels: {html.escape(row['labels'] or '—')}<br>OS: {html.escape(row['operating_system'] or 'unknown')}<br>"
                 f"Collector: {html.escape(row['collector_version'] or 'unknown')} · Zellij: {html.escape(row['backend_version'] or 'unknown')} · protocol: {row['protocol_version'] if row['protocol_version'] is not None else 'unknown'}<br>"
                 f"Last heartbeat: {seen} · last upload: {html.escape(row['last_upload_at'] or 'never')} · queue: {row['queue_size']} · config revision: {row['config_revision']}")
-            items.append(f"<div class=collector-row><div><strong>{html.escape(row['name'])}</strong><div class=meta>{kind} · {state}</div>{buttons}</div><div class=meta>{details}{compatibility}{error}{configure}</div></div>")
+            items.append(f"<div class=collector-row><div><strong>{html.escape(row['name'])}</strong><div class=meta>{kind} · {state} · <span class='{('warning' if connection != 'online' else '')}'>{connection}</span> ({seen_age})</div>{buttons}</div><div class=meta>{details}{compatibility}{error}{configure}</div></div>")
         body=("<div class=actions><a class=btn href='/'>Calendar</a></div><h1>Collector admin</h1>"
               "<p class=muted>Create a named identity for a remote collector. The JWT is displayed once.</p>"
               f"{message}<form method=post action='/admin/collectors'><input type=hidden name=csrf value='{csrf}'><input name=name required maxlength=120 placeholder='Office workstation'><button>Generate token</button></form>"
@@ -437,16 +457,23 @@ class App(BaseHTTPRequestHandler):
                         episode_summary=episode[4])
         return item
 
-    @staticmethod
-    def search_form(query: str = "") -> str:
-        return f"<h1>BastionCam</h1><form action='/'><input type=search name=q placeholder='compilation last Tuesday' value='{html.escape(query)}'><button>Search</button></form>"
+    def search_form(self, query: str = "", collector_id: str = "") -> str:
+        db=connect(self.db_path)
+        collectors=db.execute("SELECT id,name,revoked_at FROM collectors ORDER BY name").fetchall();db.close()
+        options=["<option value=''>All collectors</option>"]
+        for collector in collectors:
+            selected=" selected" if collector["id"]==collector_id else ""
+            suffix=" (revoked)" if collector["revoked_at"] else ""
+            options.append(f"<option value='{html.escape(collector['id'])}'{selected}>{html.escape(collector['name']+suffix)}</option>")
+        return f"<h1>BastionCam</h1><form action='/'><input type=search name=q placeholder='compilation last Tuesday' value='{html.escape(query)}'><select name=collector aria-label=Collector>{''.join(options)}</select><button>Search</button></form>"
 
-    def index(self, query: str, range_start: str = "", range_end: str = "") -> None:
-        form = self.search_form(query)
+    def index(self, query: str, range_start: str = "", range_end: str = "", collector_id: str = "") -> None:
+        form = self.search_form(query,collector_id)
         if range_start or range_end:
             db=connect(self.db_path);clauses=[];params=[]
             if range_start:clauses.append("g.ended_at>=?");params.append(range_start)
             if range_end:clauses.append("g.started_at<?");params.append(range_end)
+            if collector_id:clauses.append("p.collector_id=?");params.append(collector_id)
             rows=db.execute(f"""SELECT g.first_snapshot_id id,g.pane_id,g.started_at captured_at,
                 g.summary excerpt,g.first_snapshot_id episode_start_id,g.last_snapshot_id episode_end_id,
                 g.started_at episode_started,g.ended_at episode_ended,g.summary episode_summary,
@@ -456,14 +483,14 @@ class App(BaseHTTPRequestHandler):
             results=[]
             for row in rows:
                 item=dict(row);item.update(score=0,kind="episode");results.append(item)
-            return self.send_results(form,results,f"Time range: {range_start or '…'} — {range_end or '…'}","episodes")
+            return self.send_results(form,results,f"Time range: {range_start or '…'} — {range_end or '…'}","episodes",collector_id)
         if not query.strip():
             db = connect(self.db_path)
             panes = db.execute("""SELECT p.session_name,p.tab_name,p.title,p.pane_key,p.command,p.cwd,c.name collector_name,
                 count(s.id) snapshot_count,max(s.captured_at) latest
                 FROM panes p LEFT JOIN snapshots s ON s.pane_id=p.id
                 LEFT JOIN collectors c ON c.id=p.collector_id
-                GROUP BY p.id ORDER BY latest DESC""").fetchall()
+                WHERE (?='' OR p.collector_id=?) GROUP BY p.id ORDER BY latest DESC""",(collector_id,collector_id)).fetchall()
             db.close()
             cards = []
             for pane in panes:
@@ -481,6 +508,7 @@ class App(BaseHTTPRequestHandler):
                 params: list[object] = [fts_expression(text)]; dates = []
                 if start: dates.append("s.captured_at>=?"); params.append(start)
                 if end: dates.append("s.captured_at<?"); params.append(end)
+                if collector_id:dates.append("p.collector_id=?");params.append(collector_id)
                 rows = db.execute(f"""SELECT s.id,s.pane_id,s.captured_at,substr(s.content,1,700) excerpt,
                     p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name,bm25(snapshots_fts) rank
                     FROM snapshots_fts JOIN snapshots s ON s.id=snapshots_fts.rowid JOIN panes p ON p.id=s.pane_id
@@ -495,6 +523,7 @@ class App(BaseHTTPRequestHandler):
                     params = []; dates = ["g.status='done'", "g.embedding IS NOT NULL"]
                     if start: dates.append("g.ended_at>=?"); params.append(start)
                     if end: dates.append("g.started_at<?"); params.append(end)
+                    if collector_id:dates.append("p.collector_id=?");params.append(collector_id)
                     rows = db.execute(f"""SELECT g.first_snapshot_id id,g.pane_id,g.started_at captured_at,
                         g.summary excerpt,g.embedding,g.first_snapshot_id episode_start_id,g.last_snapshot_id episode_end_id,
                         g.started_at episode_started,g.ended_at episode_ended,g.summary episode_summary,
@@ -511,6 +540,7 @@ class App(BaseHTTPRequestHandler):
                 params = []; dates = []
                 if start: dates.append("s.captured_at>=?"); params.append(start)
                 if end: dates.append("s.captured_at<?"); params.append(end)
+                if collector_id:dates.append("p.collector_id=?");params.append(collector_id)
                 rows = db.execute(f"""SELECT s.id,s.pane_id,s.captured_at,substr(s.content,1,700) excerpt,
                     p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name
                     FROM snapshots s JOIN panes p ON p.id=s.pane_id LEFT JOIN collectors c ON c.id=p.collector_id
@@ -521,10 +551,11 @@ class App(BaseHTTPRequestHandler):
             db.close(); return self.send_page(form + f"<p>Search error: {html.escape(str(error))}</p>")
         db.close(); rows = sorted(results.values(), key=lambda x:(x["score"],x["captured_at"]), reverse=True)[:100]
         time_note=f"Time filter: {interpretation} · {start or ''} — {end or ''}" if interpretation else ""
-        self.send_results(form,rows,time_note)
+        self.send_results(form,rows,time_note,collector_id=collector_id)
 
-    def send_results(self, form: str, rows: list[dict], note: str = "", noun: str = "results") -> None:
+    def send_results(self, form: str, rows: list[dict], note: str = "", noun: str = "results", collector_id: str = "") -> None:
         items=[]
+        collector_query=f"?{urlencode({'collector':collector_id})}" if collector_id else ""
         for i,r in enumerate(rows):
             label=" / ".join(filter(None,[r["session_name"],r["tab_name"],r["title"],r["pane_key"]]))
             collector=html.escape(r.get("collector_name") or "unassigned")
@@ -532,18 +563,19 @@ class App(BaseHTTPRequestHandler):
             if r.get("episode_started"):
                 period=f"<div class=episode>Episode: {html.escape(r['episode_started'])} — {html.escape(r['episode_ended'])}</div>"
             summary=r.get("episode_summary") or r.get("excerpt") or ""; start_id=r.get("episode_start_id") or r["id"]
-            items.append(f"<div class=result id=result-{i}><div class=meta>Collector: {collector} · {html.escape(r['captured_at'])} · {html.escape(label)} · <span class=badge>{r['kind']} {pct}%</span></div><div class=meta>cwd: {html.escape(r.get('cwd') or '—')}</div>{period}<p class=summary>{html.escape(summary)}</p><div class=actions><a class=btn href='/snapshot/{r['id']}'>Open moment</a><a class=btn href='/snapshot/{start_id}'>Episode start</a></div></div>")
+            items.append(f"<div class=result id=result-{i}><div class=meta>Collector: {collector} · {html.escape(r['captured_at'])} · {html.escape(label)} · <span class=badge>{r['kind']} {pct}%</span></div><div class=meta>cwd: {html.escape(r.get('cwd') or '—')}</div>{period}<p class=summary>{html.escape(summary)}</p><div class=actions><a class=btn href='/snapshot/{r['id']}{collector_query}'>Open moment</a><a class=btn href='/snapshot/{start_id}{collector_query}'>Episode start</a></div></div>")
         time_note=f"<p class=meta>{html.escape(note)}</p>" if note else ""
         self.send_page(form+time_note+f"<p>Found: {len(rows)} {noun}</p>"+"".join(items))
 
-    def player(self, snapshot_id: int) -> None:
+    def player(self, snapshot_id: int, collector_id: str = "") -> None:
         db=connect(self.db_path); row=db.execute("""SELECT s.*,p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name
             FROM snapshots s JOIN panes p ON p.id=s.pane_id LEFT JOIN collectors c ON c.id=p.collector_id WHERE s.id=?""",(snapshot_id,)).fetchone()
         if not row: db.close(); return self.send_error(404)
         episode=db.execute("SELECT summary,started_at,ended_at FROM segments WHERE pane_id=? AND first_snapshot_id<=? AND last_snapshot_id>=? ORDER BY id DESC LIMIT 1",(row["pane_id"],snapshot_id,snapshot_id)).fetchone();db.close()
         label=" / ".join(filter(None,[row["session_name"],row["tab_name"],row["title"],row["pane_key"]]))
         summary=f"<p class=summary>{html.escape(episode['summary'])}</p>" if episode and episode["summary"] else ""
-        controls="""<div class=controls><a class=btn href='/'>Search</a><button id=prev>◀</button><button id=play>▶</button><button id=next>▶|</button><select id=speed><option value=1>1×</option><option value=2>2×</option><option value=5 selected>5×</option><option value=10>10×</option></select><input id=slider type=range min=0 value=0><span id=position></span></div><div class=controls><span id=clock class=clock></span><input id=jump type=datetime-local><span class=muted>Changed lines are highlighted in green</span></div>"""
+        back=f"/?{urlencode({'collector':collector_id})}" if collector_id else "/"
+        controls=f"""<div class=controls><a class=btn href='{back}'>Search</a><button id=prev>◀</button><button id=play>▶</button><button id=next>▶|</button><select id=speed><option value=1>1×</option><option value=2>2×</option><option value=5 selected>5×</option><option value=10>10×</option></select><input id=slider type=range min=0 value=0><span id=position></span></div><div class=controls><span id=clock class=clock></span><input id=jump type=datetime-local><span class=muted>Changed lines are highlighted in green</span></div>"""
         script=PLAYER_JS.replace("INITIAL_ID",str(snapshot_id))
         collector=html.escape(row["collector_name"] or "unassigned")
         self.send_page(f"<h1>{html.escape(label)}</h1><div class=meta>Collector: {collector} · cwd: {html.escape(row['cwd'] or '—')}</div>{summary}{controls}<pre id=screen>{html.escape(row['content'])}</pre>{script}")
