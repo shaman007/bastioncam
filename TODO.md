@@ -1,13 +1,32 @@
 # Product roadmap
 
-This document tracks planned work beyond the current local MVP. Items are listed
-in the intended implementation order, but are not yet assigned to releases.
+This document tracks planned work beyond the current MVP. The deployed baseline
+already includes authenticated users, named JWT collector identities, collector
+heartbeats and inventory, protocol-v1 compatibility checks, remote configuration,
+TLS ingress, searchable snapshots and summaries, and calendar/episode navigation.
+
+## Small next improvements
+
+These are intentionally narrow changes that reuse the current SQLite schema and
+web application and should not require new infrastructure:
+
+- Show collectors as online, stale, or offline using configurable heartbeat-age
+  thresholds. Sort unhealthy collectors first and show their age in friendly form.
+- Add a collector selector to search and calendar pages. Preserve the selected
+  collector in result, episode, day, and hour links.
+- Expand `/healthz` with database readability/writability and schema-version
+  checks, while keeping the response safe for unauthenticated probes.
+- Add simple pagination and result-count limits to search and collector inventory.
+- Add one-click copying of a newly generated collector token and a ready-to-paste
+  collector command. Continue displaying the token only once.
 
 ## 1. Collector identity and inventory
 
-- Add explicit online/offline thresholds and notifications for collectors that
-  stop sending heartbeats.
-- Report protocol and version compatibility problems.
+- Add notifications for collectors that remain offline beyond a configured
+  threshold. Basic online/stale/offline presentation is tracked above.
+- Allow administrators to rotate a collector credential without replacing its
+  identity or historical ownership.
+- Add bulk owner/label editing after the single-collector workflow has settled.
 
 ## 2. Search scopes and navigation
 
@@ -15,19 +34,18 @@ in the intended implementation order, but are not yet assigned to releases.
   label, and date range.
 - Support saved searches and bookmarks.
 - Add a global activity timeline across collectors.
-- Search both generated summaries and raw snapshots.
-- Link each summary item to the underlying session timestamp.
 - Group repetitive results by task or session.
 - Show how a natural-language query was interpreted and allow corrections.
 
-## 3. Secure collector transport
+## 3. Collector transport hardening
 
-- Protect collector-to-server traffic with TLS.
-- Authenticate each collector with a key or client certificate.
-- Support credential rotation and collector revocation.
-- Add replay protection and protocol versioning.
-- Preserve durable uploads with retry, deduplication, compression, backpressure,
-  and bandwidth limits.
+- Add optional mutual TLS for environments that require client certificates in
+  addition to the current per-collector JWT authentication.
+- Add credential rotation; permanent collector revocation is already supported.
+- Add replay protection on top of the current protocol version and upload
+  deduplication checks.
+- Extend the current durable local queue and retry behavior with compression,
+  explicit backpressure, and bandwidth limits.
 
 Detailed design notes are in `deploy/SECURITY_ROADMAP.md`.
 
@@ -65,8 +83,8 @@ Detailed design notes are in `deploy/SECURITY_ROADMAP.md`.
   retaining SQLite for standalone installations.
 - Evaluate object storage for compressed raw session data.
 - Add database backup, restore, migration, and retention jobs.
-- Add Prometheus metrics, readiness checks, structured logs, and an admin
-  diagnostics page.
+- Add Prometheus metrics, structured logs, and an admin diagnostics page. Basic
+  and expanded readiness checks are tracked in the small-improvements section.
 - Add resource usage and storage growth forecasts.
 
 ## 8. Reporting and automation
