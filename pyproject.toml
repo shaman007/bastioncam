@@ -2,6 +2,7 @@
 name = "bastioncam"
 version = "0.1.0"
 description = "Local searchable history and playback for Zellij panes"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = ["detect-secrets>=1.5,<2"]
 
