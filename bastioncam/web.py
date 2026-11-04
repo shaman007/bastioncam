@@ -5,14 +5,19 @@ import hashlib
 import hmac
 import json
 import calendar
+import sqlite3
+import shlex
+import os
+from pathlib import Path
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, quote
 from zoneinfo import ZoneInfo
 
 from .auth import TokenError, authenticate, create_collector
-from .db import connect, cosine, decode_embedding
+from .db import SCHEMA_VERSION, connect, cosine, decode_embedding
+from . import oidc
 from .llm import embed_query
 from .protocol import MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, compatibility_error
 from .search import fts_expression, parse_query
@@ -86,6 +91,81 @@ class App(BaseHTTPRequestHandler):
     ollama_url = "http://127.0.0.1:11434"
     embed_model = "nomic-embed-text"
 
+    def oidc_config(self):
+        return oidc.Config.from_env()
+
+    def health(self) -> None:
+        try:
+            path = Path(self.db_path).expanduser().resolve()
+            db = sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=2)
+            try:
+                if db.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+                    raise ValueError('schema')
+                db.execute('SELECT id FROM users LIMIT 1').fetchall()
+                db.execute('SELECT id FROM snapshots LIMIT 1').fetchall()
+                db.execute('SELECT issuer,subject FROM oidc_identities LIMIT 1').fetchall()
+                db.execute('SELECT config_revision FROM collectors LIMIT 1').fetchall()
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("INSERT OR REPLACE INTO server_settings(key,value) VALUES('health_probe','ok')")
+                db.rollback()
+            finally:
+                db.close()
+        except Exception:
+            return self.send_json({'status': 'unavailable'}, 503)
+        self.send_json({'status': 'ok'})
+
+    def oidc_login(self) -> None:
+        try:
+            config = self.oidc_config()
+            if not config or not self.users_exist():
+                return self.send_error(404)
+            db = connect(self.db_path)
+            try: location, state = oidc.begin(db, config)
+            finally: db.close()
+            self.redirect(location, f'zh_oidc={state}; Path=/auth/oidc; HttpOnly; Secure; SameSite=Lax; Max-Age=600')
+        except Exception:
+            self.send_auth_page('<h1>SSO unavailable</h1><a href="/login">Return to login</a>', 503)
+
+    def oidc_callback(self, params) -> None:
+        try:
+            config = self.oidc_config()
+            if not config or not self.users_exist():
+                return self.send_error(404)
+            cookie = SimpleCookie(); cookie.load(self.headers.get('Cookie', ''))
+            browser_state = cookie['zh_oidc'].value if 'zh_oidc' in cookie else ''
+            db = connect(self.db_path)
+            try:
+                user = oidc.complete(db, config, params.get('state', [''])[0], browser_state, params.get('code', [''])[0])
+                token, _ = create_session(db, user['id'])
+            finally: db.close()
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Set-Cookie', f'zh_session={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800')
+            self.send_header('Set-Cookie', 'zh_oidc=; Path=/auth/oidc; HttpOnly; Secure; SameSite=Lax; Max-Age=0')
+            self.send_header('Content-Length', '0'); self.end_headers()
+        except Exception:
+            self.send_auth_page('<h1>SSO login failed</h1><p>Restart login or contact your administrator.</p><a href="/login">Return to login</a>', 401)
+
+    def page_number(self) -> int:
+        try: return max(1, min(10000, int(parse_qs(urlparse(self.path).query).get('page', ['1'])[0])))
+        except (ValueError, AttributeError): return 1
+
+    def pagination(self, total: int, size: int = 20) -> tuple[int, str]:
+        number = min(self.page_number(), max(1, (total + size - 1) // size))
+        params = parse_qs(urlparse(getattr(self, 'path', '/')).query)
+        links = []
+        for label, target in [('Previous', number - 1), ('Next', number + 1)]:
+            if 1 <= target <= (total + size - 1) // size:
+                params['page'] = [str(target)]
+                links.append(f"<a class=btn href='{html.escape(urlparse(getattr(self, 'path', '/')).path + '?' + urlencode(params, doseq=True))}'>{label}</a>")
+        return (number - 1) * size, f'<p>Page {number} · {total} results</p><div class=actions>{" ".join(links)}</div>'
+
+    def session_cookie(self, token: str, max_age: int = 604800) -> str:
+        secure = self.oidc_config() is not None or urlparse(os.environ.get('BASTIONCAM_PUBLIC_URL', '')).scheme == 'https'
+        return f'zh_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}' + ('; Secure' if secure else '')
+
     def cookie_token(self) -> str:
         cookie=SimpleCookie();cookie.load(self.headers.get("Cookie", ""))
         return cookie["zh_session"].value if "zh_session" in cookie else ""
@@ -102,11 +182,15 @@ class App(BaseHTTPRequestHandler):
 
     def redirect(self, location: str, cookie: str = "") -> None:
         self.send_response(303);self.send_header("Location",location)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Referrer-Policy', 'no-referrer')
         if cookie:self.send_header("Set-Cookie",cookie)
         self.send_header("Content-Length","0");self.end_headers()
 
     def send_auth_page(self, body: str, status: int = 200) -> None:
         data=page(body,"",title="BastionCam login");self.send_response(status)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header("Content-Type","text/html; charset=utf-8")
         self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
 
@@ -131,15 +215,47 @@ class App(BaseHTTPRequestHandler):
 
     def send_page(self, body: str, status: int = 200) -> None:
         data = page(body, self.sidebar()); self.send_response(status)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data)))
         self.end_headers(); self.wfile.write(data)
+
+    def selected_collector(self) -> str:
+        return parse_qs(urlparse(getattr(self, 'path', '/')).query).get('collector', [''])[0]
+
+    @staticmethod
+    def period_rows(db, collector_id: str):
+        if not collector_id:
+            return db.execute('SELECT * FROM period_summaries ORDER BY period_start').fetchall()
+        rows = db.execute("""SELECT g.started_at,g.ended_at,g.summary FROM segments g
+            JOIN panes p ON p.id=g.pane_id WHERE p.collector_id=? AND g.status='done'
+            AND trim(coalesce(g.summary,''))<>'' ORDER BY g.started_at""", (collector_id,)).fetchall()
+        groups = {}
+        tz = ZoneInfo('Europe/Prague')
+        for row in rows:
+            local = datetime.fromisoformat(row['started_at']).astimezone(tz)
+            for kind in ('hour', 'day'):
+                start = local.replace(minute=0,second=0,microsecond=0)
+                if kind == 'day': start = start.replace(hour=0)
+                utc_start = start.astimezone(ZoneInfo('UTC'))
+                utc_end = utc_start + timedelta(hours=1) if kind == 'hour' else (start + timedelta(days=1)).astimezone(ZoneInfo('UTC'))
+                key = kind, utc_start.isoformat(timespec='seconds')
+                group = groups.setdefault(key, dict(period_type=kind, period_start=key[1],
+                    period_end=utc_end.isoformat(timespec='seconds'), summary='', segment_count=0))
+                group['summary'] += ('\n\n' if group['summary'] else '') + row['summary']
+                group['segment_count'] += 1
+        return list(groups.values())
 
     def sidebar(self) -> str:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
         admin_links="<a href='/admin/collectors'>Collector admin</a> · <a href='/admin/users'>Users</a>" if user and user["role"]=="admin" else ""
         db = connect(self.db_path)
-        rows = db.execute("""SELECT period_type,period_start,period_end,summary,segment_count
-            FROM period_summaries ORDER BY period_start DESC,period_type LIMIT 12""").fetchall(); db.close()
+        collector_id=self.selected_collector()
+        if collector_id:
+            rows=sorted(self.period_rows(db,collector_id),key=lambda row:row['period_start'],reverse=True)[:12]
+        else:
+            rows=db.execute('SELECT * FROM period_summaries ORDER BY period_start DESC,period_type LIMIT 12').fetchall()
+        db.close()
         if not rows:
             return f"<h2>Summaries</h2><p class=muted>Summaries will appear after the first episodes are processed.</p><p>{admin_links}</p><form method=post action='/logout'><input type=hidden name=csrf value='{csrf}'><button>Log out</button></form>"
         tz = ZoneInfo("Europe/Prague"); cards=[]
@@ -147,7 +263,7 @@ class App(BaseHTTPRequestHandler):
             start=datetime.fromisoformat(row["period_start"]).astimezone(tz)
             label=start.strftime("%d.%m.%Y, %H:00") if row["period_type"]=="hour" else start.strftime("%d.%m.%Y")
             kind="Hour" if row["period_type"]=="hour" else "Day"
-            cards.append(f"<a href='/?month={start:%Y-%m}&day={start:%Y-%m-%d}' style='color:inherit;text-decoration:none'><div class=period-card><div class=period-title>{kind} · {label} · episodes: {row['segment_count']}</div><p>{html.escape(row['summary'])}</p></div></a>")
+            cards.append(f"<a href='/calendar?month={start:%Y-%m}&amp;day={start:%Y-%m-%d}&amp;collector={quote(collector_id, safe='')}' style='color:inherit;text-decoration:none'><div class=period-card><div class=period-title>{kind} · {label} · episodes: {row['segment_count']}</div><p>{html.escape(row['summary'])}</p></div></a>")
         return "<h2><a href='/' style='color:inherit'>Work summaries</a></h2>"+"".join(cards)+f"<p>{admin_links}</p><form method=post action='/logout'><input type=hidden name=csrf value='{csrf}'><button>Log out</button></form>"
 
     def send_json(self, value: object, status: int = 200) -> None:
@@ -158,7 +274,9 @@ class App(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         url = urlparse(self.path)
         try:
-            if url.path == "/healthz": return self.send_json({"status": "ok"})
+            if url.path == "/healthz": return self.health()
+            if url.path == "/auth/oidc/login": return self.oidc_login()
+            if url.path == "/auth/oidc/callback": return self.oidc_callback(parse_qs(url.query))
             if url.path == "/setup":return self.setup_page()
             if url.path == "/login":return self.login_page()
             if not self.require_user():return
@@ -166,11 +284,11 @@ class App(BaseHTTPRequestHandler):
                 params=parse_qs(url.query)
                 query=params.get("q",[""])[0]
                 collector_id=params.get("collector",[""])[0]
-                if query.strip() or "start" in params or "end" in params or collector_id:
+                if query.strip() or "start" in params or "end" in params or (collector_id and params.get("view", [""])[0] != "calendar"):
                     return self.index(query,params.get("start",[""])[0],params.get("end",[""])[0],collector_id)
-                return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0])
+                return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0],params.get("collector",[""])[0])
             if url.path == "/calendar":
-                params=parse_qs(url.query); return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0])
+                params=parse_qs(url.query); return self.calendar_view(params.get("month",[""])[0],params.get("day",[""])[0],params.get("collector",[""])[0])
             if url.path == "/admin/collectors":
                 if self.require_admin():return self.admin_collectors()
                 return
@@ -184,15 +302,15 @@ class App(BaseHTTPRequestHandler):
             pass
         self.send_error(404)
 
-    def calendar_view(self, month_value: str, day_value: str) -> None:
+    def calendar_view(self, month_value: str, day_value: str, collector_id: str = "") -> None:
         tz=ZoneInfo("Europe/Prague"); today=datetime.now(tz).date()
         try: month=datetime.strptime(month_value,"%Y-%m").date().replace(day=1) if month_value else today.replace(day=1)
         except ValueError: month=today.replace(day=1)
         try: selected=datetime.strptime(day_value,"%Y-%m-%d").date() if day_value else (today if month==today.replace(day=1) else month)
         except ValueError: selected=today
         db=connect(self.db_path)
-        snapshot_rows=db.execute("SELECT captured_at FROM snapshots ORDER BY captured_at").fetchall()
-        summary_rows=db.execute("SELECT period_type,period_start,period_end,summary,segment_count FROM period_summaries ORDER BY period_start").fetchall();db.close()
+        snapshot_rows=db.execute("SELECT s.captured_at FROM snapshots s JOIN panes p ON p.id=s.pane_id WHERE (?='' OR p.collector_id=?) ORDER BY s.captured_at", (collector_id,collector_id)).fetchall()
+        summary_rows=self.period_rows(db, collector_id);db.close()
         activity:dict[str,int]={}
         for row in snapshot_rows:
             key=datetime.fromisoformat(row["captured_at"]).astimezone(tz).date().isoformat();activity[key]=activity.get(key,0)+1
@@ -202,7 +320,7 @@ class App(BaseHTTPRequestHandler):
             if local.date()==selected:summaries.append(item)
         previous=(month.replace(day=1)-timedelta(days=1)).replace(day=1)
         next_month=(month.replace(day=28)+timedelta(days=4)).replace(day=1)
-        header=f"<div class=calendar-head><a class=btn href='/?month={previous:%Y-%m}'>&larr;</a><h1>{month.strftime('%B %Y')}</h1><a class=btn href='/?month={next_month:%Y-%m}'>&rarr;</a></div>"
+        header=f"<div class=calendar-head><a class=btn href='/calendar?month={previous:%Y-%m}&amp;collector={quote(collector_id, safe='')}'>&larr;</a><h1>{month.strftime('%B %Y')}</h1><a class=btn href='/calendar?month={next_month:%Y-%m}&amp;collector={quote(collector_id, safe='')}'>&rarr;</a></div>"
         weekdays="".join(f"<div class=weekday>{name}</div>" for name in calendar.day_abbr)
         cells=[]
         for date in calendar.Calendar(firstweekday=0).itermonthdates(month.year,month.month):
@@ -211,12 +329,12 @@ class App(BaseHTTPRequestHandler):
             if key in activity:classes.append("active")
             if date==selected:classes.append("selected")
             count=f"<span class=day-count>{activity[key]} snapshots</span>" if key in activity else ""
-            cells.append(f"<a class='{' '.join(classes)}' href='/?month={month:%Y-%m}&day={key}'><strong>{date.day}</strong>{count}</a>")
+            cells.append(f"<a class='{' '.join(classes)}' href='/calendar?month={month:%Y-%m}&amp;day={key}&amp;collector={quote(collector_id, safe='')}'><strong>{date.day}</strong>{count}</a>")
         daily=next((s for s in summaries if s["period_type"]=="day"),None)
         hours=sorted((s for s in summaries if s["period_type"]=="hour"),key=lambda s:s["local"])
         detail=f"<h2>{selected.strftime('%A, %d %B %Y')}</h2>"
         if daily:
-            query=urlencode({"start":daily["period_start"],"end":daily["period_end"]})
+            query=urlencode({"start":daily["period_start"],"end":daily["period_end"],"collector":collector_id})
             count=daily["segment_count"]
             label=f"{count} episode{'s' if count != 1 else ''}"
             detail+=f"<div class=day-summary><h3>Daily summary</h3><p>{html.escape(daily['summary'])}</p><div class=meta><a class=episode-link href='/?{query}'>{label}</a></div></div>"
@@ -225,13 +343,13 @@ class App(BaseHTTPRequestHandler):
         if hours:
             hour_cards=[]
             for summary in hours:
-                query=urlencode({"start":summary["period_start"],"end":summary["period_end"]})
+                query=urlencode({"start":summary["period_start"],"end":summary["period_end"],"collector":collector_id})
                 count=summary["segment_count"]
                 label=f"{count} episode{'s' if count != 1 else ''}"
                 hour_cards.append(f"<div class=hour-summary><h3>{summary['local']:%H:00}</h3><p>{html.escape(summary['summary'])}</p><div class=meta><a class=episode-link href='/?{query}'>{label}</a></div></div>")
             detail+="<h2>Hour by hour</h2>"+"".join(hour_cards)
         elif selected.isoformat() in activity:detail+="<h2>Hour by hour</h2><p class=muted>Hourly summaries are pending.</p>"
-        self.send_page(self.search_form()+header+f"<div class=calendar>{weekdays}{''.join(cells)}</div>"+detail)
+        self.send_page(self.search_form(collector_id=collector_id)+header+f"<div class=calendar>{weekdays}{''.join(cells)}</div>"+detail)
 
     def do_POST(self) -> None:
         path=urlparse(self.path).path
@@ -247,14 +365,14 @@ class App(BaseHTTPRequestHandler):
                 db=connect(self.db_path)
                 try:delete_session(db,self.cookie_token())
                 finally:db.close()
-                return self.redirect("/login","zh_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+                return self.redirect("/login",self.session_cookie("", 0))
             if path == "/admin/users":
                 if user["role"] != "admin":return self.send_error(403,"Administrator access required")
                 try:
                     password=values.get("password",[""])[0]
                     if password != values.get("confirm_password",[""])[0]:raise ValueError("passwords do not match")
                     db=connect(self.db_path)
-                    try:new_user=create_user(db,values.get("username",[""])[0],password,"reader")
+                    try:new_user=create_user(db,values.get("username",[""])[0],password,values.get("role",["reader"])[0])
                     finally:db.close()
                     return self.admin_users(message=f"Created user {new_user['username']}.")
                 except ValueError as error:return self.admin_users(error=str(error),status=400)
@@ -266,17 +384,32 @@ class App(BaseHTTPRequestHandler):
                 try:user_id=int(values.get("user_id",[""])[0])
                 except ValueError:return self.admin_users(error="Invalid user.",status=400)
                 action=values.get("action",[""])[0];db=connect(self.db_path)
-                row=db.execute("SELECT role,blocked_at FROM users WHERE id=?",(user_id,)).fetchone()
-                if not row or row["role"] != "reader":db.close();return self.admin_users(error="Reader not found.",status=404)
-                if action == "block":
-                    blocked_at=None if row["blocked_at"] else datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
-                    db.execute("UPDATE users SET blocked_at=? WHERE id=?",(blocked_at,user_id))
-                    if blocked_at:db.execute("DELETE FROM web_sessions WHERE user_id=?",(user_id,))
-                elif action == "delete":
-                    db.execute("DELETE FROM web_sessions WHERE user_id=?",(user_id,))
-                    db.execute("DELETE FROM users WHERE id=?",(user_id,))
-                else:db.close();return self.admin_users(error="Unknown user action.",status=400)
-                db.commit();db.close();return self.redirect("/admin/users")
+                try:
+                    db.execute('BEGIN IMMEDIATE')
+                    row=db.execute("SELECT role,blocked_at FROM users WHERE id=?",(user_id,)).fetchone()
+                    if not row:raise ValueError('User not found.')
+                    if user_id == user['id']:raise ValueError('You cannot change your own account here.')
+                    if action not in ('block','delete','role'):raise ValueError('Unknown user action.')
+                    role=values.get('role',['reader'])[0]
+                    if action=='role' and role not in ('admin','reader'):raise ValueError('Invalid role.')
+                    removing_admin=(row['role']=='admin' and not row['blocked_at'] and
+                                    (action in ('block','delete') or role!='admin'))
+                    if removing_admin and db.execute("SELECT count(*) FROM users WHERE role='admin' AND blocked_at IS NULL").fetchone()[0] <= 1:
+                        raise ValueError('Keep at least one active administrator.')
+                    if action == 'block':
+                        blocked_at=None if row['blocked_at'] else datetime.now(ZoneInfo('UTC')).isoformat(timespec='seconds')
+                        db.execute('UPDATE users SET blocked_at=? WHERE id=?',(blocked_at,user_id))
+                    elif action == 'role':
+                        db.execute('UPDATE users SET role=? WHERE id=?',(role,user_id))
+                    else:
+                        db.execute('DELETE FROM users WHERE id=?',(user_id,))
+                    db.execute('DELETE FROM web_sessions WHERE user_id=?',(user_id,))
+                    db.commit()
+                except ValueError as error:
+                    db.rollback();db.close();return self.admin_users(error=str(error),status=400)
+                finally:
+                    db.close()
+                return self.redirect('/admin/users')
             if path == "/admin/collectors":
                 if user["role"] != "admin":return self.send_error(403,"Administrator access required")
                 try:
@@ -404,7 +537,7 @@ class App(BaseHTTPRequestHandler):
                 user=create_user(db,values.get("username",[""])[0],password)
                 token,_=create_session(db,user["id"])
             finally:db.close()
-            return self.redirect("/",f"zh_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
+            return self.redirect("/",self.session_cookie(token))
         except (ValueError,UnicodeDecodeError) as error:return self.setup_page(str(error),400)
         except Exception:return self.setup_page("Could not create the first admin.",500)
 
@@ -412,7 +545,9 @@ class App(BaseHTTPRequestHandler):
         if self.current_user():return self.redirect("/")
         if not self.users_exist():return self.redirect("/setup")
         message=f"<div class=notice>{html.escape(error)}</div>" if error else ""
-        self.send_auth_page("<h1>Sign in</h1>"+message+
+        try: sso = "<p><a class=btn href='/auth/oidc/login'>Sign in with SSO</a></p>" if self.oidc_config() else ""
+        except ValueError: sso = '<p>SSO configuration is incomplete. Contact your administrator.</p>'
+        self.send_auth_page("<h1>Sign in</h1>"+message+sso+
             "<form method=post action='/login'><input name=username required autocomplete=username placeholder='Username'><input type=password name=password required autocomplete=current-password placeholder='Password'><button>Sign in</button></form>",status)
 
     def login_submit(self) -> None:
@@ -425,36 +560,55 @@ class App(BaseHTTPRequestHandler):
             if not user:return self.login_page("Invalid username or password.",401)
             token,_=create_session(db,user["id"])
         finally:db.close()
-        self.redirect("/",f"zh_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
+        self.redirect("/",self.session_cookie(token))
 
     def admin_users(self, message: str = "", error: str = "", status: int = 200) -> None:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
         db=connect(self.db_path)
-        rows=db.execute("SELECT id,username,created_at,role,blocked_at FROM users ORDER BY created_at").fetchall();db.close()
+        rows=db.execute("""SELECT u.id,u.username,u.created_at,u.role,u.blocked_at,
+            EXISTS(SELECT 1 FROM oidc_identities i WHERE i.user_id=u.id) AS is_oidc
+            FROM users u ORDER BY u.created_at,u.id""").fetchall();db.close()
         notice=f"<div class=notice>{html.escape(error or message)}</div>" if error or message else ""
-        admins="".join(f"<div class=collector-row><strong>{html.escape(row['username'])}</strong><div class=meta>Admin · created {html.escape(row['created_at'])}</div></div>" for row in rows if row["role"]=="admin")
-        readers=[]
+        items=[]
         for row in rows:
-            if row["role"] != "reader":continue
-            state="blocked" if row["blocked_at"] else "active"
-            readers.append(f"<div class=collector-row><div><strong>{html.escape(row['username'])}</strong><div class=meta>Reader · {state} · created {html.escape(row['created_at'])}</div></div><form method=post action='/admin/users/action'><input type=hidden name=csrf value='{csrf}'><input type=hidden name=user_id value='{row['id']}'><button name=action value=block>{'Unblock' if row['blocked_at'] else 'Block'}</button><button class=danger name=action value=delete onclick=\"return confirm('Delete this reader permanently?')\">Delete</button></form></div>")
+            state='blocked' if row['blocked_at'] else 'active'
+            source='SSO' if row['is_oidc'] else 'Local'
+            controls=''
+            if row['id'] != user['id']:
+                options=''.join(f"<option value='{role}'{' selected' if row['role']==role else ''}>{role.title()}</option>" for role in ('reader','admin'))
+                controls=(f"<form method=post action='/admin/users/action'><input type=hidden name=csrf value='{csrf}'>"
+                    f"<input type=hidden name=user_id value='{row['id']}'><select name=role aria-label=Role>{options}</select>"
+                    f"<button name=action value=role>Set role</button><button name=action value=block>{'Unblock' if row['blocked_at'] else 'Block'}</button>"
+                    "<button class=danger name=action value=delete onclick=\"return confirm('Delete this user? An SSO user may sign up again; block to deny access.')\">Delete</button></form>")
+            items.append(f"<div class=collector-row><div><strong>{html.escape(row['username'])}</strong><div class=meta>{source} · {row['role'].title()} · {state} · created {html.escape(row['created_at'])}</div></div>{controls}</div>")
         body=("<div class=actions><a class=btn href='/'>Calendar</a><a class=btn href='/admin/collectors'>Collectors</a></div><h1>Users</h1>"
-              "<p class=muted>Readers can view recordings and summaries. Administrators can manage readers and collectors.</p>"+notice+
-              f"<form method=post action='/admin/users'><input type=hidden name=csrf value='{csrf}'><input name=username required maxlength=80 autocomplete=off placeholder='Username'><input type=password name=password required minlength=10 autocomplete=new-password placeholder='Password'><input type=password name=confirm_password required minlength=10 autocomplete=new-password placeholder='Confirm password'><button>Add reader</button></form><h2>Readers</h2>"+("".join(readers) if readers else "<p class=muted>No readers yet.</p>")+"<h2>Administrators</h2>"+admins)
+              "<p class=muted>Readers can view the shared recording library. Administrators manage users and collectors. New SSO users are readers. Block an SSO account to deny future logins.</p>"+notice+
+              f"<form method=post action='/admin/users'><input type=hidden name=csrf value='{csrf}'><input name=username required maxlength=80 autocomplete=off placeholder='Username'><input type=password name=password required minlength=10 autocomplete=new-password placeholder='Password'><input type=password name=confirm_password required minlength=10 autocomplete=new-password placeholder='Confirm password'><select name=role aria-label=Role><option value=reader>Reader</option><option value=admin>Admin</option></select><button>Add local user</button></form>"+''.join(items))
         self.send_page(body,status)
 
     def admin_collectors(self, token: str = "", created_name: str = "", error: str = "",
                          status: int = 200) -> None:
         user=self.current_user();csrf=html.escape(user["csrf_token"] if user else "")
         db=connect(self.db_path)
-        rows=list(db.execute("SELECT * FROM collectors ORDER BY created_at DESC").fetchall());db.close()
+        total=db.execute('SELECT count(*) FROM collectors').fetchone()[0]
+        offset,navigation=self.pagination(total)
+        rows=db.execute("""SELECT * FROM collectors ORDER BY CASE
+            WHEN last_seen_at IS NULL OR julianday(last_seen_at)<julianday('now','-300 seconds') THEN 2
+            WHEN julianday(last_seen_at)<julianday('now','-90 seconds') THEN 1 ELSE 0 END DESC,
+            created_at,id LIMIT 20 OFFSET ?""", (offset,)).fetchall();db.close()
         presence={row["id"]:collector_presence(row["last_seen_at"]) for row in rows}
-        rows.sort(key=lambda row:(-presence[row["id"]][2],row["created_at"]))
         message=""
         if token:
             message=(f"<div class=notice><strong>Token for {html.escape(created_name)}</strong>"
-                     "<p>Copy it now. It cannot be shown again.</p>"
-                     f"<textarea class=token readonly>{html.escape(token)}</textarea></div>")
+                     "<p>Copy it now. It cannot be shown again. Run the command, then paste the token at its hidden prompt.</p>"
+                     f"<textarea id=new-token class=token readonly>{html.escape(token)}</textarea>"
+                     "<button type=button data-copy=new-token>Copy token</button>"
+                     f"<textarea id=collector-command class=token readonly>{html.escape(self.collector_command())}</textarea>"
+                     "<button type=button data-copy=collector-command>Copy command</button><span id=copy-status role=status></span>"
+                     "<script>document.querySelectorAll('[data-copy]').forEach(b=>b.onclick=async()=>{"
+                     "const t=document.getElementById(b.dataset.copy);try{await navigator.clipboard.writeText(t.value);"
+                     "document.getElementById('copy-status').textContent='Copied';}catch(e){t.select();"
+                     "document.getElementById('copy-status').textContent='Press Ctrl+C to copy the selected text';}});</script></div>")
         elif error:message=f"<div class=notice>{html.escape(error)}</div>"
         items=[]
         for row in rows:
@@ -475,8 +629,18 @@ class App(BaseHTTPRequestHandler):
         body=("<div class=actions><a class=btn href='/'>Calendar</a></div><h1>Collector admin</h1>"
               "<p class=muted>Create a named identity for a remote collector. The JWT is displayed once.</p>"
               f"{message}<form method=post action='/admin/collectors'><input type=hidden name=csrf value='{csrf}'><input name=name required maxlength=120 placeholder='Office workstation'><button>Generate token</button></form>"
-              "<h2>Collectors</h2>"+("".join(items) if items else "<p class=muted>No collectors yet.</p>"))
+              "<h2>Collectors</h2>"+navigation+("".join(items) if items else "<p class=muted>No collectors yet.</p>"))
         self.send_page(body,status)
+
+    def collector_command(self) -> str:
+        config = self.oidc_config()
+        origin = os.environ.get('BASTIONCAM_PUBLIC_URL', '').rstrip('/')
+        if not origin and config:
+            parsed = urlparse(config.redirect_uri)
+            origin = f'{parsed.scheme}://{parsed.netloc}'
+        origin = origin or 'http://127.0.0.1:8787'
+        return ("printf 'Collector token: '; read -r -s BASTIONCAM_TOKEN; printf '\\n'; export BASTIONCAM_TOKEN\n"
+                "bastioncam --db ~/.local/share/bastioncam/collector.db collect --interval 5 --server-url " + shlex.quote(origin))
 
     @staticmethod
     def add_episode(db, item: dict) -> dict:
@@ -499,7 +663,7 @@ class App(BaseHTTPRequestHandler):
             selected=" selected" if collector["id"]==collector_id else ""
             suffix=" (revoked)" if collector["revoked_at"] else ""
             options.append(f"<option value='{html.escape(collector['id'])}'{selected}>{html.escape(collector['name']+suffix)}</option>")
-        return f"<h1>BastionCam</h1><form action='/'><input type=search name=q placeholder='compilation last Tuesday' value='{html.escape(query)}'><select name=collector aria-label=Collector>{''.join(options)}</select><button>Search</button></form>"
+        return f"<h1>BastionCam</h1><form action='/'><input type=search name=q placeholder='compilation last Tuesday' value='{html.escape(query)}'><select name=collector aria-label=Collector>{''.join(options)}</select><button>Search</button><button formaction=/calendar>Calendar</button></form>"
 
     def index(self, query: str, range_start: str = "", range_end: str = "", collector_id: str = "") -> None:
         form = self.search_form(query,collector_id)
@@ -513,7 +677,7 @@ class App(BaseHTTPRequestHandler):
                 g.started_at episode_started,g.ended_at episode_ended,g.summary episode_summary,
                 p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name
                 FROM segments g JOIN panes p ON p.id=g.pane_id LEFT JOIN collectors c ON c.id=p.collector_id
-                WHERE {' AND '.join(clauses)} ORDER BY g.started_at DESC""",params).fetchall();db.close()
+                WHERE {' AND '.join(clauses)} ORDER BY g.started_at DESC LIMIT 1000""",params).fetchall();db.close()
             results=[]
             for row in rows:
                 item=dict(row);item.update(score=0,kind="episode");results.append(item)
@@ -524,10 +688,11 @@ class App(BaseHTTPRequestHandler):
                 count(s.id) snapshot_count,max(s.captured_at) latest
                 FROM panes p LEFT JOIN snapshots s ON s.pane_id=p.id
                 LEFT JOIN collectors c ON c.id=p.collector_id
-                WHERE (?='' OR p.collector_id=?) GROUP BY p.id ORDER BY latest DESC""",(collector_id,collector_id)).fetchall()
+                WHERE (?='' OR p.collector_id=?) GROUP BY p.id ORDER BY latest DESC LIMIT 1000""",(collector_id,collector_id)).fetchall()
             db.close()
+            offset,navigation=self.pagination(len(panes))
             cards = []
-            for pane in panes:
+            for pane in panes[offset:offset+20]:
                 label = " / ".join(filter(None, [pane["session_name"], pane["tab_name"],
                                                    pane["title"], pane["pane_key"]]))
                 details = " · ".join(filter(None, [pane["command"], pane["cwd"]]))
@@ -535,7 +700,7 @@ class App(BaseHTTPRequestHandler):
                 cards.append(f"<div class=result><div class=meta>Collector: {collector} · {html.escape(label)}</div>"
                              f"<p>{pane['snapshot_count']} snapshots · latest {html.escape(pane['latest'] or 'never')}</p>"
                              f"<div class=meta>{html.escape(details)}</div></div>")
-            return self.send_page(form + "<h2>Recorded panes</h2>" + "".join(cards))
+            return self.send_page(form + "<h2>Recorded panes</h2>" + navigation + "".join(cards))
         text, start, end, interpretation = parse_query(query); db = connect(self.db_path); results: dict[int, dict] = {}
         try:
             if text:
@@ -547,7 +712,7 @@ class App(BaseHTTPRequestHandler):
                     p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name,bm25(snapshots_fts) rank
                     FROM snapshots_fts JOIN snapshots s ON s.id=snapshots_fts.rowid JOIN panes p ON p.id=s.pane_id
                     LEFT JOIN collectors c ON c.id=p.collector_id
-                    WHERE snapshots_fts MATCH ? {('AND '+' AND '.join(dates)) if dates else ''} ORDER BY rank LIMIT 60""", params).fetchall()
+                    WHERE snapshots_fts MATCH ? {('AND '+' AND '.join(dates)) if dates else ''} ORDER BY rank LIMIT 1000""", params).fetchall()
                 for row in rows:
                     item = self.add_episode(db, dict(row)); item.update(score=1.0, kind="text")
                     results[row["id"]] = item
@@ -578,19 +743,20 @@ class App(BaseHTTPRequestHandler):
                 rows = db.execute(f"""SELECT s.id,s.pane_id,s.captured_at,substr(s.content,1,700) excerpt,
                     p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name
                     FROM snapshots s JOIN panes p ON p.id=s.pane_id LEFT JOIN collectors c ON c.id=p.collector_id
-                    {('WHERE '+' AND '.join(dates)) if dates else ''} ORDER BY s.captured_at DESC LIMIT 100""", params).fetchall()
+                    {('WHERE '+' AND '.join(dates)) if dates else ''} ORDER BY s.captured_at DESC LIMIT 1000""", params).fetchall()
                 for row in rows:
                     item=self.add_episode(db,dict(row));item.update(score=0,kind="time");results[row["id"]]=item
         except Exception as error:
             db.close(); return self.send_page(form + f"<p>Search error: {html.escape(str(error))}</p>")
-        db.close(); rows = sorted(results.values(), key=lambda x:(x["score"],x["captured_at"]), reverse=True)[:100]
+        db.close(); rows = sorted(results.values(), key=lambda x:(x["score"],x["captured_at"]), reverse=True)[:1000]
         time_note=f"Time filter: {interpretation} · {start or ''} — {end or ''}" if interpretation else ""
         self.send_results(form,rows,time_note,collector_id=collector_id)
 
     def send_results(self, form: str, rows: list[dict], note: str = "", noun: str = "results", collector_id: str = "") -> None:
         items=[]
         collector_query=f"?{urlencode({'collector':collector_id})}" if collector_id else ""
-        for i,r in enumerate(rows):
+        offset,navigation=self.pagination(len(rows))
+        for i,r in enumerate(rows[offset:offset+20]):
             label=" / ".join(filter(None,[r["session_name"],r["tab_name"],r["title"],r["pane_key"]]))
             collector=html.escape(r.get("collector_name") or "unassigned")
             pct=round(r["score"]*100); period=""
@@ -599,7 +765,7 @@ class App(BaseHTTPRequestHandler):
             summary=r.get("episode_summary") or r.get("excerpt") or ""; start_id=r.get("episode_start_id") or r["id"]
             items.append(f"<div class=result id=result-{i}><div class=meta>Collector: {collector} · {html.escape(r['captured_at'])} · {html.escape(label)} · <span class=badge>{r['kind']} {pct}%</span></div><div class=meta>cwd: {html.escape(r.get('cwd') or '—')}</div>{period}<p class=summary>{html.escape(summary)}</p><div class=actions><a class=btn href='/snapshot/{r['id']}{collector_query}'>Open moment</a><a class=btn href='/snapshot/{start_id}{collector_query}'>Episode start</a></div></div>")
         time_note=f"<p class=meta>{html.escape(note)}</p>" if note else ""
-        self.send_page(form+time_note+f"<p>Found: {len(rows)} {noun}</p>"+"".join(items))
+        self.send_page(form+time_note+f"<p>Found: {len(rows)} {noun} (maximum 1000)</p>"+navigation+"".join(items))
 
     def player(self, snapshot_id: int, collector_id: str = "") -> None:
         db=connect(self.db_path); row=db.execute("""SELECT s.*,p.session_name,p.tab_name,p.title,p.pane_key,p.cwd,c.name collector_name
@@ -626,11 +792,16 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"pane_id":row[0],"snapshots":[dict(x) for x in rows]})
 
     def log_message(self, fmt: str, *args) -> None:
-        print("http:",fmt%args)
+        if urlparse(self.path).path.startswith('/auth/oidc/'):
+            print('http: OIDC request')
+        else:
+            print("http:",fmt%args)
 
 
 def serve(db_path: str, host: str, port: int, ollama_url: str = "http://127.0.0.1:11434",
           embed_model: str = "nomic-embed-text") -> None:
+    oidc.Config.from_env()  # Fail fast on partial or unsafe SSO configuration.
+    db=connect(db_path);db.close()
     App.db_path=db_path; App.ollama_url=ollama_url; App.embed_model=embed_model
     print(f"BastionCam: http://{host}:{port}")
     ThreadingHTTPServer((host,port),App).serve_forever()

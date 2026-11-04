@@ -25,12 +25,53 @@ terminal does not grow the database.
 
 On first open, `/setup` creates the initial administrator. Browser access then
 requires a username and password. The initial account has the `admin` role and
-can create, block, unblock, and delete `reader` accounts under `/admin/users`.
+can create local users, change `admin`/`reader` roles, and block, unblock, or
+delete other accounts under `/admin/users`. Role changes and blocking revoke
+existing browser sessions. Administrators cannot modify their own account there.
 Readers can view recordings and summaries but cannot access administration.
 Passwords are stored as salted scrypt hashes; browser sessions
 use seven-day HttpOnly, SameSite cookies and CSRF tokens on administrative
 forms. The health check and JWT-authenticated ingestion endpoint do not use the
 browser session.
+
+## OIDC single sign-on
+
+OIDC login is optional. Create the first local administrator through `/setup`
+before enabling SSO; keep this account for recovery. Register a confidential
+OIDC client with authorization-code flow, PKCE S256, RS256 ID tokens, and
+`client_secret_post` token endpoint authentication. Set its exact callback URL to
+`https://your-bastioncam-host/auth/oidc/callback`.
+
+Configure these environment variables for the **server** through your secret
+manager or a protected environment file:
+
+| Variable | Value |
+| --- | --- |
+| `BASTIONCAM_OIDC_ISSUER` | Exact issuer URL, for example `https://sso.example/realms/home` |
+| `BASTIONCAM_OIDC_CLIENT_ID` | Registered client ID |
+| `BASTIONCAM_OIDC_CLIENT_SECRET` | Client secret, supplied through your secret manager |
+| `BASTIONCAM_OIDC_REDIRECT_URI` | Exact HTTPS callback URL registered above |
+
+All four are required together. Discovery and callback URLs must use HTTPS;
+provider certificates must be trusted by the server. Startup rejects incomplete
+configuration. Leave all four unset to retain password-only login. No provider
+or deployment configuration is created automatically.
+
+The login page offers **Sign in with SSO**. Login uses browser-bound, single-use
+state, a nonce, PKCE, and validation of the ID token signature, issuer, audience,
+authorized party, and expiry. Accounts are identified by issuer and subject;
+matching email addresses or usernames never link an existing local account.
+New SSO accounts receive the `reader` role and a recognizable username with a
+unique suffix. A local administrator can promote them after their first login.
+
+All readers can view the shared recording library, including every collector.
+Collector filters are navigation filters, not user or team access boundaries.
+Restrict who can use the client at your identity provider. User/team-specific
+recording permissions remain planned. Blocking an SSO account denies new logins
+and revokes sessions; deleting it permits a fresh reader account on the next
+SSO login. Provider account changes do not automatically revoke an existing
+BastionCam session; use local blocking when immediate revocation is needed.
+Logout ends the BastionCam session and leaves the provider session active.
 
 ## Automatic startup
 
@@ -56,7 +97,12 @@ on-disk outbox. Failed deliveries remain queued and are retried on the next
 collection cycle:
 
 First open `/admin/collectors` on the server, enter a human-readable collector
-name, and generate a JWT. The token is shown once. Store it in a mode-0600
+name, and generate a JWT. The token is shown once with **Copy token** and
+**Copy command** buttons. Run the command in Bash or Zsh, then paste the token
+into its hidden prompt; the token is not included in shell history. Set
+`BASTIONCAM_PUBLIC_URL` on the server to generate commands for its public URL
+(the OIDC callback origin is used when this is unset and SSO is configured).
+For persistent collector startup, store the token in a mode-0600
 environment file:
 
 ```bash
@@ -91,6 +137,9 @@ Admin inventory classifies heartbeat age as online (up to 90 seconds), stale
 (up to five minutes), or offline, and lists unhealthy collectors first. Search
 can be scoped to one collector, including revoked collectors' historical data;
 the selection is retained when opening a result or returning from playback.
+Search and collector inventory show 20 items per page. Search considers at most
+1,000 results (semantic matching examines the latest 5,000 eligible episodes).
+Narrow the query or time range when this cap is reached.
 
 ## Container image
 
@@ -140,7 +189,10 @@ collection and full-text search remain available if Ollama is unavailable.
 Hourly summaries refresh no more than every ten minutes, and the current daily
 summary refreshes no more than once per hour.
 
-The calendar is the `/` home page, with search at the top. Activity days are
+The calendar is the `/` home page, with search at the top. Choose a collector
+and press **Calendar** to scope activity and summaries. Scoped hour/day cards
+combine that collector's processed episode summaries; the all-collector view
+continues to use the generated global summaries. Activity days are
 marked with snapshot counts; selecting a day shows its daily summary followed by
 chronological hour-by-hour summaries. Each hourly episode count links to the
 episodes overlapping that hour.
@@ -158,6 +210,14 @@ terminal-specific rules for assignments, authorization headers, known token
 formats, and PEM blocks. Generic Base64/hex entropy and public-IP detectors are
 disabled to avoid destroying ordinary terminal output. Detection lowers risk but
 cannot guarantee that every possible secret will be found.
+
+## Readiness
+
+`GET /healthz` is public and returns only `{"status":"ok"}` (200) or
+`{"status":"unavailable"}` (503). It checks the expected schema version,
+required tables, database reads, and a rolled-back test write. It does not create
+a missing database, expose database paths or errors, or check Ollama availability.
+The server initializes/migrates the database before accepting requests.
 
 ## Current limitations
 

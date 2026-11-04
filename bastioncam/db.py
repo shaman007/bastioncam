@@ -6,6 +6,8 @@ import sqlite3
 from pathlib import Path
 
 
+SCHEMA_VERSION = 1
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -133,6 +135,18 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL DEFAULT 'admin' CHECK(role IN ('admin','reader')),
   blocked_at TEXT
 );
+CREATE TABLE IF NOT EXISTS oidc_identities (
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY(issuer, subject)
+);
+CREATE TABLE IF NOT EXISTS oidc_flows (
+  state_hash TEXT PRIMARY KEY,
+  nonce TEXT NOT NULL,
+  verifier TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS web_sessions (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -152,6 +166,9 @@ def connect(path: str | Path) -> sqlite3.Connection:
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
+    if db.execute('PRAGMA user_version').fetchone()[0] > SCHEMA_VERSION:
+        db.close()
+        raise ValueError('Database schema is newer than this application')
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
     columns = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
@@ -185,6 +202,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
         db.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
     if "blocked_at" not in user_columns:
         db.execute("ALTER TABLE users ADD COLUMN blocked_at TEXT")
+    db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     db.commit()
     return db
 

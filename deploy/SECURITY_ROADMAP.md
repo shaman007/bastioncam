@@ -1,8 +1,13 @@
 # Transport and authentication roadmap
 
-The current UI and collector-admin endpoint is plain HTTP and unauthenticated.
-Ingestion requires a server-generated per-collector HS256 JWT. The deployment must
-only be used on a trusted network. Do not expose it to the public Internet.
+Browser access requires a local account or optional native OIDC login.
+Administration requires the `admin` role and CSRF validation. New OIDC users
+receive `reader` access to the shared recording library; per-user/team recording
+permissions remain planned. See `README.md` for OIDC setup and revocation behavior.
+
+Ingestion requires a server-generated per-collector HS256 JWT. The standalone
+HTTP listener must sit behind trusted TLS ingress for remote access; OIDC
+requires HTTPS. JWT ingestion does not provide request-level replay protection.
 
 ## TLS
 
@@ -27,7 +32,7 @@ shared bearer token:
 4. The server enforces a short clock-skew window and persists recently used
    nonces to prevent replay.
 5. Public keys can be independently revoked and rotated.
-6. UI authentication remains separate, ideally through an existing OIDC proxy.
+6. UI authentication remains separate through local sessions or native OIDC.
 
 Ed25519 authentication will replace the MVP JWT protocol before any
 Internet-facing deployment. Until then, JWTs provide named identities and

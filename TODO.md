@@ -5,18 +5,19 @@ already includes authenticated users, named JWT collector identities, collector
 heartbeats and inventory, protocol-v1 compatibility checks, remote configuration,
 TLS ingress, searchable snapshots and summaries, and calendar/episode navigation.
 
-## Small next improvements
+## Implemented small improvements
 
-These are intentionally narrow changes that reuse the current SQLite schema and
-web application and should not require new infrastructure:
+- Collector-scoped calendar activity and hour/day episode-summary cards, including
+  sidebar navigation. The all-collector view retains generated global summaries.
+- `/healthz` database read/write and schema checks with a safe public response.
+- Search and collector inventory pagination (20 items per page), with a 1,000-result
+  search cap and a 5,000-episode semantic candidate cap.
+- One-time token copying and a collector launch command with a hidden token prompt.
+- Optional OIDC login, automatic reader provisioning, and admin-managed user roles,
+  blocking, unblocking, and deletion. Local administrator login remains available.
 
-- Add collector scoping to calendar activity and summaries. Collector-scoped
-  snapshot and episode search is already supported.
-- Expand `/healthz` with database readability/writability and schema-version
-  checks, while keeping the response safe for unauthenticated probes.
-- Add simple pagination and result-count limits to search and collector inventory.
-- Add one-click copying of a newly generated collector token and a ready-to-paste
-  collector command. Continue displaying the token only once.
+These changes are implemented in source; live OIDC provider configuration and
+end-to-end deployment verification are separate steps.
 
 ## 1. Collector identity and inventory
 
@@ -49,8 +50,8 @@ Detailed design notes are in `deploy/SECURITY_ROADMAP.md`.
 
 ## 4. Users, roles, and SSO
 
-- Add OIDC-based SSO.
-- Add `admin`, `operator`, and `reader` roles.
+- OIDC SSO and `admin`/`reader` roles are implemented; add an `operator` role
+  once its permissions have been defined.
 - Scope collectors and search results to users or teams.
 - Add access-controlled, expiring links to session moments.
 - Record an audit log for login, search, export, deletion, and configuration
