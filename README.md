@@ -118,7 +118,7 @@ set -a; . ~/.config/bastioncam/collector.env; set +a
   --db ~/.local/share/bastioncam/collector.db \
   collect \
   --interval 5 \
-  --server-url http://bastioncam.w386.k8s.my.lan
+  --server-url http://bastioncam.int.andreybondarenko.com
 ```
 
 The remote server requires the JWT as a Bearer token on `POST /api/ingest`, uses
