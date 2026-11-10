@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   test-and-publish:
@@ -36,6 +37,7 @@ jobs:
             type=sha
             type=ref,event=tag
       - uses: docker/build-push-action@v6
+        id: publish
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -44,3 +46,17 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Sign and verify published image
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          image="ghcr.io/shaman007/bastioncam@$DIGEST"
+          cosign sign --yes "$image"
+          cosign verify \
+            --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image"
